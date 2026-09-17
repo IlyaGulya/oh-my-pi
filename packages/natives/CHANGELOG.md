@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed in-process background builtins leaking out of the subshell that started them: a subshell body runs on a cloned shell whose job table is discarded on return, and dropping a `JoinHandle` detached the task instead of stopping it, so `( yes > /dev/null & )` kept burning one core per invocation until the process exited ([#12309](https://github.com/can1357/oh-my-pi/issues/12309)).
+
 ## [18.2.1] - 2026-09-15
 
 ### Added

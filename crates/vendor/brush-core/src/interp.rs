@@ -583,9 +583,12 @@ fn spawn_async_ao_list_in_task<SE: extensions::ShellExtensions>(
 	cloned_shell.options_mut().interactive = false;
 
 	let join_handle = tokio::spawn(async move {
-		cloned_ao_list
-			.execute(&mut cloned_shell, &cloned_params)
-			.await
+		let result = cloned_ao_list.execute(&mut cloned_shell, &cloned_params).await;
+		// The task owns a cloned shell, and that clone's job table is discarded
+		// when the task returns: abort any in-process background work it started
+		// so it cannot outlive the scope that owns it (issue #12309).
+		abort_internal_background_jobs(&mut cloned_shell);
+		result
 	});
 
 	jobs::Job::new(
@@ -593,6 +596,20 @@ fn spawn_async_ao_list_in_task<SE: extensions::ShellExtensions>(
 		ao_list.to_string(),
 		jobs::JobState::Running,
 	)
+}
+
+/// Abort in-process background tasks owned by a shell scope that is ending.
+///
+/// A child process outlives the shell that started it — the kernel reparents it —
+/// but an in-process builtin cannot: dropping its `JoinHandle` detaches the task
+/// instead of stopping it, so the job keeps running with no job table left to
+/// reach it. Callers invoke this wherever a shell, or a clone standing in for a
+/// subshell, is discarded (issue #12309). External process jobs are left to the
+/// process tree, which the host signals through its own teardown path.
+fn abort_internal_background_jobs(shell: &mut Shell<impl extensions::ShellExtensions>) {
+	for job in &mut shell.jobs_mut().jobs {
+		job.abort_internal_tasks();
+	}
 }
 
 #[async_trait::async_trait]
@@ -1030,6 +1047,15 @@ impl Execute for ast::CompoundCommand {
 						error.into_result(&subshell)
 					},
 				};
+
+				// The subshell's job table is discarded here, and an in-process
+				// background task cannot be orphaned the way a child process can:
+				// dropping its `JoinHandle` detaches the task instead of stopping
+				// it, leaving a builtin spinning with nothing able to reach it
+				// (`( yes > /dev/null & )` burned a core per invocation until the
+				// process exited — issue #12309). Abort what this scope started;
+				// external process jobs are left to the process tree.
+				abort_internal_background_jobs(&mut subshell);
 
 				// Preserve the subshell's exit code, but don't honor any of its requests to
 				// exit the shell, break out of loops, etc.

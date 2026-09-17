@@ -4718,6 +4718,68 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 		);
 	}
 
+	/// A builtin backgrounded *inside a subshell* must not outlive the subshell.
+	///
+	/// The subshell body runs on a cloned `Shell`; its job table is discarded
+	/// when the body returns, and dropping a `JoinHandle` detaches its task
+	/// instead of stopping it — so the job kept spinning with nothing left able
+	/// to reach it (issue #12309: `( yes > /dev/null & )` burned a core per
+	/// invocation until the process exited).
+	#[tokio::test(flavor = "multi_thread")]
+	async fn one_shot_completion_aborts_subshell_internal_background_jobs() {
+		let marker = tempfile::NamedTempFile::new().expect("marker file");
+		let marker_path = marker.path().to_string_lossy();
+		std::fs::remove_file(marker.path()).expect("remove initial marker");
+		let command = format!("( {{ sleep 1; echo leaked > {}; }} & )", quote_arg(&marker_path));
+
+		execute_shell(
+			ShellExecuteOptions { command, ..Default::default() },
+			None,
+			CancelToken::default(),
+		)
+		.await
+		.expect("one-shot shell execution");
+		time::sleep(Duration::from_millis(2000)).await;
+
+		assert!(
+			!marker.path().exists(),
+			"a subshell's internal background job outlived its one-shot shell session"
+		);
+	}
+
+	/// The persistent-session shape from the report: the host keeps the shell
+	/// alive across calls, so nothing drops the session core and only the
+	/// subshell's own scope can reap a builtin it backgrounded.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn persistent_shell_subshell_aborts_internal_background_jobs() {
+		let _guard = shell_test_lock().lock().await;
+		let shell = Shell::new(None);
+		let marker = tempfile::NamedTempFile::new().expect("marker file");
+		let marker_path = marker.path().to_string_lossy();
+		std::fs::remove_file(marker.path()).expect("remove initial marker");
+
+		shell
+			.run(
+				ShellRunOptions {
+					command: format!("( {{ sleep 1; echo leaked > {}; }} & )", quote_arg(&marker_path)),
+					..Default::default()
+				},
+				None,
+				CancelToken::default(),
+			)
+			.await
+			.expect("run subshell");
+
+		time::sleep(Duration::from_millis(2000)).await;
+
+		assert!(
+			!marker.path().exists(),
+			"a subshell's internal background job outlived its subshell in the persistent shell"
+		);
+		shell.abort().await;
+	}
+
 	/// `live_background_job_count` reports 0 when the session has no live
 	/// external background jobs and 1 while one is running. The host relies on
 	/// this to retain a per-call shell whose `&`/`nohup` child is still alive
