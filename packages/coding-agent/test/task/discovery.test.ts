@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { disableProvider, enableProvider } from "@oh-my-pi/pi-coding-agent/capability";
+import { disableProvider, enableProvider, isProviderEnabled } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { clearAgentPluginRootCache } from "@oh-my-pi/pi-coding-agent/discovery/agent-plugin-format";
 import {
@@ -232,6 +232,40 @@ describe("discoverAgents", () => {
 
 		expect(names).toContain("explicit-agent");
 		expect(names).not.toEqual(expect.arrayContaining(["stale-agent", "settings-agent", "loom-verify-spec"]));
+	});
+
+	test("disabled native discovery cannot shadow a selected package agent with an ambient project definition", async () => {
+		const selected = path.join(tempHome, "selected-package");
+		const name = "scoped-shadow-probe";
+		await fs.mkdir(path.join(projectDir, ".omp", "agents"), { recursive: true });
+		await fs.mkdir(path.join(selected, "agents"), { recursive: true });
+		await Bun.write(
+			path.join(projectDir, ".omp", "agents", `${name}.md`),
+			["---", `name: ${name}`, "description: Ambient project definition", "---", "AMBIENT_AGENT_BODY_7f3a"].join(
+				"\n",
+			),
+		);
+		await Bun.write(
+			path.join(selected, "agents", `${name}.md`),
+			["---", `name: ${name}`, "description: Explicit selected definition", "---", "SELECTED_AGENT_BODY_7f3a"].join(
+				"\n",
+			),
+		);
+		const nativeEnabled = isProviderEnabled("native");
+		disableProvider("native");
+		try {
+			const result = await discoverAgents(projectDir, tempHome, {
+				explicit: [selected],
+				configured: [],
+				configuredLevel: "user",
+				mode: "explicit-only",
+			});
+			expect(result.agents.find(agent => agent.name === name)?.systemPrompt).toBe("SELECTED_AGENT_BODY_7f3a");
+			expect(result.projectAgentsDir).toBeNull();
+			expect(result.searchedDirs).not.toContain(path.join(projectDir, ".omp", "agents"));
+		} finally {
+			if (nativeEnabled) enableProvider("native");
+		}
 	});
 
 	test("discovers agents from a --plugin-dir root with the foreign claude-plugins opt-in off (#11151)", async () => {

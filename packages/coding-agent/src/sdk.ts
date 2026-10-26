@@ -776,6 +776,8 @@ export interface CreateAgentSessionOptions {
 	enableMCP?: boolean;
 	/** Existing MCP manager to reuse when MCP is enabled (skips discovery, propagates to toolSession). */
 	mcpManager?: MCPManager;
+	/** Own tool/prompt/resource callbacks for an independently supplied manager; leave unset for shared subagent managers. */
+	ownsMcpCallbacks?: boolean;
 	/**
 	 * MCP tools minted from a parent's shared manager (subagent proxies). They
 	 * register as manager-owned MCP tools — active from the start and replaced
@@ -1763,6 +1765,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const mode = extensionRoots?.mode ?? (options.disableExtensionDiscovery ? "explicit-only" : "merge");
 	return await withOmpExtensionRootScope(explicit, mode, () => createAgentSessionScoped(options));
 }
+
+export const EXPLICIT_CONTEXT_DISCOVERY_VERSION = 1;
 
 async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
 	if (options.systemPromptTemplate !== undefined && options.customSystemPrompt !== undefined) {
@@ -4119,6 +4123,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				skills: cfgSkillful.get(settings) ? (session?.skills ?? skills) : [],
 				skillDescriptions,
 				contextFiles,
+				discoverAdditionalContextFiles: options.contextFiles === undefined,
 				tools: promptTools,
 				toolNames,
 				rules: rulebookRules,
@@ -5466,14 +5471,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// MCP manager wiring has two ownership models:
 		//   * Single-slot callbacks (tools/prompts/resources changed) — exactly one
-		//     owner per manager. When reusing a parent's manager (subagent path,
-		//     see task/executor.ts), the parent already owns these slots so we
-		//     MUST NOT overwrite them. Guarded by `!options.mcpManager`.
+		//     owner per manager. A supplied manager is borrowed unless the host
+		//     explicitly takes ownership with `ownsMcpCallbacks`. Shared subagent
+		//     managers keep the parent's callbacks.
 		//   * Notification listener — multi-listener by design. Every session with
 		//     an MCP manager (fresh OR reused) needs its own bridge to its own
 		//     `extensionRunner` so extensions loaded in that session receive frames.
 		//     Guarded only by `mcpManager` (see the second `if` below).
-		if (mcpManager && !options.mcpManager) {
+		if (mcpManager && (!options.mcpManager || options.ownsMcpCallbacks)) {
+			if (options.mcpManager) mcpManager.setNotificationsEnabled(cfgMcpNotifications.get(settings));
 			mcpManager.setOnToolsChanged(async tools => {
 				try {
 					await session.refreshMCPTools(tools);

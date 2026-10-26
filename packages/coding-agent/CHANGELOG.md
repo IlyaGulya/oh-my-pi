@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added SDK explicit-discovery marker 1 for scoped embeddings and opt-in ACP factory-owned MCP composition via `AcpSessionHandle.mcp`, `configureServers` and factory `options.mcpServers`, retaining native sessions and MCP teardown.
+- SDK embedders supplying an MCP manager can opt into native tool, prompt and resource refresh callbacks with `ownsMcpCallbacks`, without transferring disconnect ownership.
+
+### Fixed
+
+- Explicit SDK `contextFiles` now suppress automatic additional-root instruction discovery and refresh; disabling native discovery also prevents ambient native agent roots from overriding selected agents.
+
 ## [18.12.6] - 2026-10-21
 
 ### Added

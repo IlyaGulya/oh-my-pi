@@ -519,6 +519,8 @@ export interface BuildSystemPromptOptions {
 	additionalWorkspaceRoots?: string[];
 	/** Pre-loaded context files (skips discovery if provided). */
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
+	/** Allow additional-root discovery when the primary context list was preloaded by the native SDK. */
+	discoverAdditionalContextFiles?: boolean;
 	/** Skills provided directly to system prompt construction. */
 	skills?: readonly Skill[];
 	/** Session-scoped description snapshot; background cache writes apply only to the next session. */
@@ -645,6 +647,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd,
 		additionalWorkspaceRoots = [],
 		contextFiles: providedContextFiles,
+		discoverAdditionalContextFiles = providedContextFiles === undefined,
 		skills: providedSkills,
 		rules,
 		alwaysApplyRules,
@@ -762,6 +765,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		const primary = providedContextFiles
 			? providedContextFiles
 			: await logger.time("loadProjectContextFiles", loadProjectContextFiles, { cwd: resolvedCwd });
+		if (!discoverAdditionalContextFiles) return primary;
 		// Also discover context files (AGENTS.md, rules, etc.) for each additional workspace root.
 		const additionalRoots = additionalWorkspaceRoots.filter(d => path.resolve(d) !== path.resolve(resolvedCwd));
 		if (additionalRoots.length === 0) return primary;

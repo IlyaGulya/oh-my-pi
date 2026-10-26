@@ -98,6 +98,64 @@ For multiple concurrent top-level sessions in one process, pass a private
 `AgentRegistry` to each session. The default process-global registry admits
 only one `"Main"` identity per generation.
 
+### Explicit context discovery (AgentOS native fork)
+
+This fork exports `EXPLICIT_CONTEXT_DISCOVERY_VERSION = 1` from the SDK.
+Stock 18.12.6 does not provide this guarantee. Passing `contextFiles`, including
+`[]`, supplies the complete instruction-file set: no automatic cwd/ancestor
+refresh or additional-root AGENTS discovery is added on prompt rebuild.
+`additionalDirectories` still describes workspace roots, not permission to
+discover extra instructions. Omitting `contextFiles` retains native discovery.
+Disabling the native discovery provider also gates native agent-root discovery;
+an ambient native agent must not override an explicitly selected package agent.
+
+This option alone does not isolate every capability. Embedders must also select
+settings, provider gates, extension roots, skills, commands, tools and MCP
+explicitly. Native hooks are JS/TS extension factories, not Claude command-hook
+JSON. Keep credential/model selection (`authStorage`, `modelRegistry`) separate
+from context settings and `sessionManager`; changing accounts need not change
+context or move native history. Discovery isolation is not a filesystem or
+session-storage ACL.
+
+### ACP factory-owned MCP lifecycle
+
+The native `runAcpMode` factory receives
+`options?: { interactivePrompts?: boolean; mcpServers?: McpServer[] }`.
+It may return an `AgentSession` or an `AcpSessionHandle` with the existing
+`session`/`setToolUIContext` fields and optional:
+
+```ts
+mcp: {
+  manager: MCPManager;
+  configureServers(servers: McpServer[]): Promise<void>;
+}
+```
+
+Opt in when the factory owns selected package/server discovery. Use initial
+`options.mcpServers` when constructing that manager and compose subsequent client
+servers in `configureServers`, preserving selected package MCP. ACP delegates
+client-server changes to this hook instead of replacing the manager, uses its
+tools, and disconnects it on session teardown. Without `mcp`, existing ACP-managed
+client MCP behavior remains unchanged. With a supplied `mcpManager`, callbacks
+are borrowed by default. Set `CreateAgentSessionOptions.ownsMcpCallbacks: true`
+when this session must install native tool, prompt and resource refresh callbacks
+on that manager; BB's scoped factory opts in. Callback ownership does not transfer
+disconnect ownership: SDK session disposal does not disconnect a supplied manager;
+the ACP owner must complete teardown.
+Configuration callbacks must reconcile removed/replaced client connections rather
+than rediscovering over live connections. ACP uses the bounded native MCP startup
+barrier and refreshes the final tool snapshot; startup failures use the existing
+ACP bootstrap diagnostics.
+
+BB's scoped embedding keeps MCP auth on the fixed host native auth store,
+independent of the selected LLM configDir/broker source. This does not establish
+cloud MCP account identity. It keeps native session IDs/history and requires
+unchanged source receipts for continuation, disables shared memory, and refuses
+missing capabilities without ambient/inference fallback. Use existing native
+auth references, not copied credentials or HOME/profile swapping. Real work
+subscription, cloud MCP and macOS acceptance, and live deployment, are separate
+from synthetic loopback evidence.
+
 ## Session manager behavior (persistent vs in-memory)
 
 `AgentSession` always uses a `SessionManager`; behavior depends on which factory you use.

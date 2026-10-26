@@ -57,13 +57,14 @@ import { runExtensionCompact } from "../../extensibility/extensions/compact-hand
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { MCPManager } from "../../mcp/manager";
+import type { AcpSessionFactory, AcpSessionHandle } from "./acp-mode";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
 import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
-import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import { type AgentSession, type AgentSessionEvent, MCP_DISCOVERY_TURN_WAIT_MS } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
@@ -337,6 +338,7 @@ type ManagedSessionRecord = {
 	session: AgentSession;
 	setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined;
 	mcpManager: MCPManager | undefined;
+	mcp: AcpSessionHandle["mcp"];
 	// Ordered queue of MCP tool refreshes for this record. Rebuilt per
 	// `#configureMcpServers` call; drained on reconfigure so a stale in-flight
 	// refresh can never land after a newer configuration's tools.
@@ -399,19 +401,12 @@ type MCPSourceMap = {
 	[name: string]: MCPSource;
 };
 
-type AcpSessionHandle = {
-	session: AgentSession;
-	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
-};
-
-type CreateAcpSession = (
-	cwd: string,
-	options?: { interactivePrompts?: boolean },
-) => Promise<AgentSession | AcpSessionHandle>;
+type CreateAcpSession = AcpSessionFactory;
 
 function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
 	session: AgentSession;
 	setToolUIContext: AcpSessionHandle["setToolUIContext"] | undefined;
+	mcp?: AcpSessionHandle["mcp"];
 } {
 	return "session" in created ? created : { session: created, setToolUIContext: undefined };
 }
@@ -1598,18 +1593,20 @@ export class AcpAgent implements Agent {
 	}
 
 	async #createNewSessionRecord(cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, mcp } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
+				mcpServers,
 			}),
 		);
 		try {
 			await session.sessionManager.ensureOnDisk();
 		} catch (error) {
+			await mcp?.manager.disconnectAll();
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, mcp);
 	}
 
 	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
@@ -1644,9 +1641,11 @@ export class AcpAgent implements Agent {
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
 		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const mcpServers = params.mcpServers ?? [];
+		const { session, setToolUIContext, mcp } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(params.cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
+				mcpServers,
 			}),
 		);
 		try {
@@ -1659,10 +1658,11 @@ export class AcpAgent implements Agent {
 				throw new Error(`ACP session fork failed: ${params.sessionId}`);
 			}
 		} catch (error) {
+			await mcp?.manager.disconnectAll();
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, mcp);
 	}
 
 	async #openStoredSession(
@@ -1671,9 +1671,10 @@ export class AcpAgent implements Agent {
 		mcpServers: McpServer[],
 		sessionId: string,
 	): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, mcp } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
+				mcpServers,
 			}),
 		);
 		try {
@@ -1682,18 +1683,20 @@ export class AcpAgent implements Agent {
 				throw new Error(`ACP session load was cancelled: ${sessionId}`);
 			}
 		} catch (error) {
+			await mcp?.manager.disconnectAll();
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, mcp);
 	}
 
 	async #registerPreparedSession(
 		session: AgentSession,
 		mcpServers: McpServer[],
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined,
+		mcp: AcpSessionHandle["mcp"] = undefined,
 	): Promise<ManagedSessionRecord> {
-		const record = this.#createManagedSessionRecord(session, setToolUIContext);
+		const record = this.#createManagedSessionRecord(session, setToolUIContext, mcp);
 		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
 		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
 		// so it shares the bootstrap race guard — see that comment for why.
@@ -1711,11 +1714,13 @@ export class AcpAgent implements Agent {
 	#createManagedSessionRecord(
 		session: AgentSession,
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined = undefined,
+		mcp: AcpSessionHandle["mcp"] = undefined,
 	): ManagedSessionRecord {
 		return {
 			session,
 			setToolUIContext,
-			mcpManager: undefined,
+			mcp,
+			mcpManager: mcp?.manager,
 			mcpRefreshChain: undefined,
 			pendingMcpStartupChunks: [],
 			promptTurn: undefined,
@@ -3054,6 +3059,20 @@ export class AcpAgent implements Agent {
 	}
 
 	async #configureMcpServers(record: ManagedSessionRecord, servers: McpServer[]): Promise<void> {
+		if (record.mcp) {
+			await record.mcp.configureServers(servers);
+			const startup = await record.mcp.manager.waitForStartup(MCP_DISCOVERY_TURN_WAIT_MS);
+			await record.session.refreshMCPTools(record.mcp.manager.getTools());
+			for (const { name, error } of startup.failed) {
+				const type = record.mcp.manager.getServerConfig(name)?.type;
+				record.pendingMcpStartupChunks.push({
+					name,
+					message: error,
+					oauthCapable: type === "http" || type === "sse",
+				});
+			}
+			return;
+		}
 		if (record.mcpManager) {
 			await record.mcpManager.disconnectAll();
 		}

@@ -90,19 +90,24 @@ export async function discoverAgents(
 ): Promise<DiscoveryResult> {
 	const resolvedCwd = path.resolve(cwd);
 
-	const userDirs = getConfigDirs("agents", { project: false })
-		.filter(entry => entry.source === TASK_AGENT_CONFIG_SOURCE)
-		.map(entry => ({
-			...entry,
-			path: path.resolve(entry.path),
-		}));
+	const nativeEnabled = isProviderEnabled("native");
+	const userDirs = nativeEnabled
+		? getConfigDirs("agents", { project: false })
+				.filter(entry => entry.source === TASK_AGENT_CONFIG_SOURCE)
+				.map(entry => ({
+					...entry,
+					path: path.resolve(entry.path),
+				}))
+		: [];
 
-	const projectDirs = findAllNearestProjectConfigDirs("agents", resolvedCwd)
-		.filter(entry => entry.source === TASK_AGENT_CONFIG_SOURCE)
-		.map(entry => ({
-			...entry,
-			path: path.resolve(entry.path),
-		}));
+	const projectDirs = nativeEnabled
+		? findAllNearestProjectConfigDirs("agents", resolvedCwd)
+				.filter(entry => entry.source === TASK_AGENT_CONFIG_SOURCE)
+				.map(entry => ({
+					...entry,
+					path: path.resolve(entry.path),
+				}))
+		: [];
 
 	const orderedDirs: AgentDirectory[] = [];
 	const project = projectDirs[0];

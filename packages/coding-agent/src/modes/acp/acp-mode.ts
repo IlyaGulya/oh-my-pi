@@ -1,8 +1,9 @@
 import * as stream from "node:stream";
 import { inspect } from "node:util";
 import { getLogsDir, postmortem } from "@oh-my-pi/pi-utils";
-import { AgentSideConnection, ndJsonStream, type Stream } from "@oh-my-pi/pi-utils/acp";
+import { AgentSideConnection, type McpServer, ndJsonStream, type Stream } from "@oh-my-pi/pi-utils/acp";
 import type { ExtensionUIContext } from "../../extensibility/extensions/types";
+import type { MCPManager } from "../../mcp/manager";
 import type { AgentSession } from "../../session/agent-session";
 import { AcpAgent } from "./acp-agent";
 
@@ -10,6 +11,11 @@ import { AcpAgent } from "./acp-agent";
 export interface AcpSessionHandle {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+	/** Factory-owned native discovery; ACP must not replace its selected package servers. */
+	mcp?: {
+		manager: MCPManager;
+		configureServers(servers: McpServer[]): Promise<void>;
+	};
 }
 
 /**
@@ -20,7 +26,7 @@ export interface AcpSessionHandle {
  */
 export type AcpSessionFactory = (
 	cwd: string,
-	options?: { interactivePrompts?: boolean },
+	options?: { interactivePrompts?: boolean; mcpServers?: McpServer[] },
 ) => Promise<AgentSession | AcpSessionHandle>;
 
 /** Creates an ACP connection and exposes its agent when process-level teardown must own it. */
