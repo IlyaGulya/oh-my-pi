@@ -9,7 +9,6 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
@@ -478,15 +477,11 @@ function holdPromptStreaming(session: FakeAgentSession): () => void {
 	return () => finishPrompt();
 }
 
-type SetToolUIContextSpy = (uiContext: ExtensionUIContext, hasUI: boolean) => void;
-
 interface AgentHarness {
 	agent: AcpAgent;
 	updates: SessionNotification[];
 	abortController: AbortController;
 	sessions: FakeAgentSession[];
-	setToolUIContextSpies: SetToolUIContextSpy[];
-	sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined>;
 	cwdA: string;
 	cwdB: string;
 	findSession(sessionId: string): FakeAgentSession | undefined;
@@ -550,8 +545,6 @@ async function createHarness(
 	const updates: SessionNotification[] = [];
 	const abortController = new AbortController();
 	const sessions: FakeAgentSession[] = [];
-	const setToolUIContextSpies: SetToolUIContextSpy[] = [];
-	const sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined> = [];
 	const connection = {
 		sessionUpdate: async (notification: SessionNotification) => {
 			// Only await when a hook is configured: `await undefined` would insert a
@@ -568,7 +561,7 @@ async function createHarness(
 
 	const initialSession = new FakeAgentSession(cwdA);
 	sessions.push(initialSession);
-	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
+	const factory = async (cwd: string) => {
 		const session = new FakeAgentSession(cwd);
 		if (options.authStorage) session.authStorage = options.authStorage;
 		if (options.extensionRunners) {
@@ -580,11 +573,8 @@ async function createHarness(
 				{} as ModelRegistry,
 			);
 		}
-		const setToolUIContext = vi.fn();
 		sessions.push(session);
-		setToolUIContextSpies.push(setToolUIContext);
-		sessionFactoryOptions.push(factoryOptions);
-		return { session: session as unknown as AgentSession, setToolUIContext };
+		return { session: session as unknown as AgentSession, setToolUIContext: vi.fn() };
 	};
 
 	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession);
@@ -602,8 +592,6 @@ async function createHarness(
 		updates,
 		abortController,
 		sessions,
-		setToolUIContextSpies,
-		sessionFactoryOptions,
 		cwdA,
 		cwdB,
 		findSession: (sessionId: string) => sessions.find(session => session.sessionId === sessionId),
@@ -1869,11 +1857,15 @@ describe("ACP agent", () => {
 			return true;
 		};
 
-		const response = await harness.agent.prompt({
-			sessionId: created.sessionId,
-			prompt: [{ type: "text", text: "Say hello" }],
+		await expect(
+			harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "Say hello" }],
+			}),
+		).rejects.toMatchObject({
+			code: -32603,
+			data: { reason: "model_error", stopReason: "error" },
 		});
-		expectAcpStructure(zPromptResponse, response);
 
 		const messageChunks = harness.updates.filter(
 			update => update.sessionId === created.sessionId && update.update.sessionUpdate === "agent_message_chunk",
@@ -1919,11 +1911,15 @@ describe("ACP agent", () => {
 			return true;
 		};
 
-		const response = await harness.agent.prompt({
-			sessionId: created.sessionId,
-			prompt: [{ type: "text", text: "Say hello" }],
+		await expect(
+			harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "Say hello" }],
+			}),
+		).rejects.toMatchObject({
+			code: -32603,
+			data: { reason: "model_error", stopReason: "error" },
 		});
-		expectAcpStructure(zPromptResponse, response);
 
 		const messageChunks = harness.updates.filter(
 			update => update.sessionId === created.sessionId && update.update.sessionUpdate === "agent_message_chunk",
@@ -1934,6 +1930,199 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("rejects an empty model error and permits a successful retry in the same native session", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+		const retry = session.prompt.bind(session);
+		session.prompt = async (): Promise<boolean> => {
+			session.isStreaming = true;
+			const failedMessage = { ...makeAssistantMessage(""), stopReason: "error" as const };
+			session.sessionManager.appendMessage(failedMessage);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [failedMessage] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		await expect(
+			harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "First attempt" }],
+			}),
+		).rejects.toMatchObject({
+			code: -32603,
+			data: { reason: "model_error", stopReason: "error" },
+		});
+		session.prompt = retry;
+		const result = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Retry" }],
+		});
+		expect(result.stopReason).toBe("end_turn");
+		harness.abortController.abort();
+		await harness.agent.dispose();
+	});
+
+	it("uses the terminal assistant outcome instead of earlier errors or refusal-like answer text", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+		const failedMessage = {
+			...makeAssistantMessage(""),
+			stopReason: "error" as const,
+			errorMessage: "Connection refused",
+		};
+		const recoveredMessage = makeAssistantMessage("The earlier request was refused, but this turn recovered.");
+		session.prompt = async (): Promise<boolean> => {
+			session.isStreaming = true;
+			session.sessionManager.appendMessage(failedMessage);
+			session.sessionManager.appendMessage(recoveredMessage);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [failedMessage], isTerminal: false } as AgentSessionEvent);
+				listener({ type: "agent_end", messages: [recoveredMessage], isTerminal: true } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+		const result = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Recover" }],
+		});
+		expect(result.stopReason).toBe("end_turn");
+		harness.abortController.abort();
+		await harness.agent.dispose();
+	});
+
+	it.each(["refusal", "content_filter"])("preserves typed provider %s as an ACP refusal", async stopType => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+		session.prompt = async (): Promise<boolean> => {
+			const message = {
+				...makeAssistantMessage(""),
+				stopReason: "error" as const,
+				stopDetails: { type: stopType },
+				errorMessage: "Provider policy",
+			};
+			session.sessionManager.appendMessage(message);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [message] } as AgentSessionEvent);
+			}
+			return true;
+		};
+		const result = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Request" }],
+		});
+		expect(result.stopReason).toBe("refusal");
+		await harness.agent.dispose();
+	});
+
+	it("keeps a superseded terminal error from failing a recovered async continuation", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+		const failedMessage = {
+			...makeAssistantMessage(""),
+			stopReason: "error" as const,
+			errorMessage: "Connection refused",
+		};
+		const recovered = makeAssistantMessage("Recovered");
+		session.prompt = async (): Promise<boolean> => {
+			session.sessionManager.appendMessage(failedMessage);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [failedMessage] } as AgentSessionEvent);
+			}
+			return true;
+		};
+		let continued = false;
+		session.asyncJobDrain = async () => {
+			if (continued) return false;
+			continued = true;
+			session.sessionManager.appendMessage(recovered);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [recovered] } as AgentSessionEvent);
+			}
+			return true;
+		};
+		const result = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Continue" }],
+		});
+		expect(result.stopReason).toBe("end_turn");
+		await harness.agent.dispose();
+	});
+
+	it("does not fail a successor with an old model error after cancellation drains", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+		const oldIdle = Promise.withResolvers<void>();
+		const releaseOld = Promise.withResolvers<void>();
+		const oldDrained = Promise.withResolvers<void>();
+		let blocking = true;
+		session.waitForIdleBlocker = async () => {
+			if (!blocking) return;
+			blocking = false;
+			oldIdle.resolve();
+			await releaseOld.promise;
+		};
+		session.prompt = async (): Promise<boolean> => {
+			session.isStreaming = true;
+			const message = {
+				...makeAssistantMessage(""),
+				stopReason: "error" as const,
+				errorMessage: "Old model failure",
+			};
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [message] } as AgentSessionEvent);
+			}
+			return true;
+		};
+		const first = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "First" }],
+		});
+		await oldIdle.promise;
+		await harness.agent.cancel({ sessionId: created.sessionId });
+		expect((await first).stopReason).toBe("cancelled");
+
+		const nextStarted = Promise.withResolvers<void>();
+		const releaseNext = Promise.withResolvers<void>();
+		session.prompt = async (): Promise<boolean> => {
+			session.isStreaming = true;
+			nextStarted.resolve();
+			await releaseNext.promise;
+			const message = makeAssistantMessage("Successor completed");
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [message] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+		session.asyncJobDrain = async () => {
+			oldDrained.resolve();
+			return false;
+		};
+		const next = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Next" }],
+		});
+		await nextStarted.promise;
+		releaseOld.resolve();
+		await oldDrained.promise;
+		releaseNext.resolve();
+		expect((await next).stopReason).toBe("end_turn");
+		await harness.agent.dispose();
 	});
 
 	it("replays assistant tool calls and matching results without duplicating the start", async () => {
@@ -3381,40 +3570,6 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("installs the tool UI context when form elicitation is available", async () => {
-		const harness = await createHarness({ clientCapabilities: { elicitation: { form: {} } } });
-		const session = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
-		await harness.agent.prompt({
-			sessionId: session.sessionId,
-			prompt: [{ type: "text", text: "ping" }],
-		} as PromptRequest);
-
-		expect(harness.sessionFactoryOptions).toEqual([{ interactivePrompts: true }]);
-		expect(harness.setToolUIContextSpies).toHaveLength(1);
-		expect(harness.setToolUIContextSpies[0]).toHaveBeenCalledTimes(1);
-		expect(harness.setToolUIContextSpies[0]).toHaveBeenCalledWith(
-			expect.objectContaining({ askDialog: expect.any(Function) }),
-			true,
-		);
-
-		await harness.agent.dispose();
-	});
-
-	it("does not install the tool UI context without form elicitation", async () => {
-		const harness = await createHarness({ clientCapabilities: {} });
-		const session = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
-		await harness.agent.prompt({
-			sessionId: session.sessionId,
-			prompt: [{ type: "text", text: "ping" }],
-		} as PromptRequest);
-
-		expect(harness.sessionFactoryOptions).toEqual([{ interactivePrompts: false }]);
-		expect(harness.setToolUIContextSpies).toHaveLength(1);
-		expect(harness.setToolUIContextSpies[0]).not.toHaveBeenCalled();
-
-		await harness.agent.dispose();
-	});
-
 	it("keeps the extension UI context without form elicitation, with prompts that answer nothing", async () => {
 		const messages: string[] = [];
 		const harness = await createHarness({
@@ -3433,7 +3588,6 @@ describe("ACP agent", () => {
 		expect(runner?.hasUI()).toBe(true);
 		expect(await runner?.getUIContext().select("Spend a saved reset?", ["Yes", "No"])).toBeUndefined();
 		expect(messages).toEqual([]);
-		expect(harness.sessionFactoryOptions).toEqual([{ interactivePrompts: false }]);
 
 		await harness.agent.dispose();
 	});

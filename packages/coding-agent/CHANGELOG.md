@@ -10,6 +10,7 @@
 ### Fixed
 
 - Explicit SDK `contextFiles` now suppress automatic additional-root instruction discovery and refresh; disabling native discovery also prevents ambient native agent roots from overriding selected agents.
+- ACP now rejects terminal model failures with a structured JSON-RPC error instead of reporting a successful `end_turn`. Typed refusals and cancellation retain their outcomes; nonterminal continuations and superseded prompt handlers cannot fail a later turn.
 
 ## [18.12.6] - 2026-10-21
 

@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { AgentBusyError, type AgentToolResult, isProviderRefusalMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
 import {
@@ -169,6 +169,7 @@ type PromptTurnState = {
 	 * the error nor drop it when delivery fails.
 	 */
 	errorTextDelivery: Promise<boolean> | undefined;
+	lastAgentEnd: Extract<AgentSessionEvent, { type: "agent_end" }> | undefined;
 	/**
 	 * `abort()` is in-flight (or its bounded-timeout race). `undefined` while the turn is
 	 * running normally and after cleanup completes. The turn occupies `record.promptTurn`
@@ -1051,6 +1052,7 @@ export class AcpAgent implements Agent {
 					cancelRequested: false,
 					settled: false,
 					errorTextDelivery: undefined,
+					lastAgentEnd: undefined,
 					cleanup: undefined,
 					usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 					unsubscribe: undefined,
@@ -1800,6 +1802,10 @@ export class AcpAgent implements Agent {
 		if (!promptTurn || promptTurn.settled || promptTurn.cancelRequested) {
 			return;
 		}
+		if (event.type === "agent_end") {
+			promptTurn.lastAgentEnd = event;
+			if (event.isTerminal === false) return;
+		}
 
 		if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
 			record.toolArgsById.set(event.toolCallId, event.args);
@@ -1849,10 +1855,28 @@ export class AcpAgent implements Agent {
 			await this.#flushUnreportedTurnError(record, event);
 			await this.#emitEndOfTurnUpdates(record);
 			await this.#waitForAcpPromptIdle(record);
+			if (record.promptTurn !== promptTurn || promptTurn.settled || promptTurn.lastAgentEnd !== event) {
+				return;
+			}
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
+			const lastAssistant = event.messages.findLast(
+				(message): message is AssistantMessage => message.role === "assistant",
+			);
+			const stopReason = this.#resolveStopReason(lastAssistant, promptTurn.cancelRequested);
+			if (lastAssistant?.stopReason === "error" && stopReason !== "cancelled" && stopReason !== "refusal") {
+				this.#finishPrompt(
+					record,
+					undefined,
+					RequestError.internalError(
+						{ reason: "model_error", stopReason: "error" },
+						lastAssistant.errorMessage || "Model request failed",
+					),
+				);
+				return;
+			}
 			this.#finishPrompt(record, {
-				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
+				stopReason,
 				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
 			});
 		}
@@ -2020,28 +2044,23 @@ export class AcpAgent implements Agent {
 	}
 
 	#resolveStopReason(
-		event: Extract<AgentSessionEvent, { type: "agent_end" }>,
+		lastAssistant: AssistantMessage | undefined,
 		cancelRequested: boolean,
 	): PromptResponse["stopReason"] {
 		if (cancelRequested) {
 			return "cancelled";
 		}
-		const lastAssistant = [...event.messages]
-			.reverse()
-			.find((message): message is AssistantMessage => message.role === "assistant");
 		const reason = lastAssistant?.stopReason;
 		switch (reason) {
 			case "aborted":
 				return "cancelled";
 			case "length":
 				return "max_tokens";
-			case "error": {
-				const errorMessage = lastAssistant?.errorMessage ?? "";
-				if (/content[_ ]?filter|refus(al|ed)/i.test(errorMessage)) {
-					return "refusal";
-				}
-				return "end_turn";
-			}
+			case "error":
+				return lastAssistant &&
+					(isProviderRefusalMessage(lastAssistant) || lastAssistant.stopDetails?.type === "content_filter")
+					? "refusal"
+					: "end_turn";
 			default:
 				return "end_turn";
 		}

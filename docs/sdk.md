@@ -156,6 +156,22 @@ auth references, not copied credentials or HOME/profile swapping. Real work
 subscription, cloud MCP and macOS acceptance, and live deployment, are separate
 from synthetic loopback evidence.
 
+### ACP prompt failures
+
+A terminal assistant `stopReason: "error"` rejects `session/prompt` with JSON-RPC
+`-32603` and `data: { reason: "model_error", stopReason: "error" }`. The native
+diagnostic is still delivered in session updates before rejection. Clients must
+record a failed turn, not successful `end_turn`; an explicit retry or a new prompt
+can continue the same native session without losing history.
+
+Classification uses native state, not diagnostic prose. Typed provider refusal
+metadata (`refusal`, `sensitive`, `content_filter`) retains ACP `refusal`, and
+cancellation retains `cancelled`. Nonterminal `agent_end` events do not complete
+the prompt. After idle/async delivery drains, only the latest event owned by the
+same unsettled prompt may settle it. Native retry policy is unchanged; this adds
+no automatic retries.
+
+
 ## Session manager behavior (persistent vs in-memory)
 
 `AgentSession` always uses a `SessionManager`; behavior depends on which factory you use.
