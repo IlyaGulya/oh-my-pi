@@ -37,13 +37,21 @@ import * as video from "@oh-my-pi/pi-coding-agent/utils/video";
 import { isEnoent, postmortem } from "@oh-my-pi/pi-utils";
 import puppeteer, { type Browser, type CDPSession, type Page, type Target } from "puppeteer-core";
 
-// Capturing a host queue turn lets tests advance the supervisor's deadline with
-// fake timers while still draining its real promise/microtask continuations.
+// Capture host scheduling before an Eval realm can replace timer globals.
 const hostImmediate = setImmediate;
+const hostTimeout = setTimeout;
 export async function hostTurn(): Promise<void> {
 	const turn = Promise.withResolvers<void>();
 	hostImmediate(() => turn.resolve());
 	await turn.promise;
+}
+
+/** Keep native resource gates held beyond the supervisor's 750ms close grace. */
+export async function waitPastNativeCloseGrace(): Promise<void> {
+	const elapsed = Promise.withResolvers<void>();
+	hostTimeout(() => elapsed.resolve(), 1_000);
+	await elapsed.promise;
+	await hostTurn();
 }
 
 export type RunOutcome = { ok: true; stdout: string } | { ok: false; error: Error; stdout: string };

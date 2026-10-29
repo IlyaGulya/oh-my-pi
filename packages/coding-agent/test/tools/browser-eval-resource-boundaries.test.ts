@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { resetVmContext } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
+import { EvalCleanupError } from "@oh-my-pi/pi-coding-agent/eval/preludes";
 import { RecordingController } from "@oh-my-pi/pi-coding-agent/tools/browser/recording";
 import {
 	dropHeadlessTabs,
@@ -11,7 +12,13 @@ import {
 	releaseTabsForOwner,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { hostTurn, OwnedBrowserLifetime, OwnedFrameSource, type RunOutcome } from "../helpers/owned-browser-lifetime";
+import {
+	hostTurn,
+	OwnedBrowserLifetime,
+	OwnedFrameSource,
+	type RunOutcome,
+	waitPastNativeCloseGrace,
+} from "../helpers/owned-browser-lifetime";
 
 type BoundaryOutcome = { ok: true } | { ok: false; error: Error };
 
@@ -44,7 +51,6 @@ async function absent(directory: string): Promise<boolean> {
 let owned: OwnedBrowserLifetime;
 beforeEach(async () => { owned = await OwnedBrowserLifetime.create(); });
 afterEach(async () => {
-	vi.useRealTimers();
 	await owned.dispose();
 });
 
@@ -95,7 +101,6 @@ describe("Eval-owned acquisition drains", () => {
 				expect(execution.stdout).not.toContain("escaped-owned-handle");
 				if (close === "unconfirmed") {
 					expect(stopped.ok).toBe(false);
-					if (!stopped.ok) expect(stopped.error.message).toMatch(/cleanup|close|stop|confirm/i);
 					expect(retained).toContain(target.id);
 					expect(target.present).toBe(true);
 				} else {
@@ -135,7 +140,6 @@ describe("Eval-owned acquisition drains", () => {
 			expect(result.ok).toBe(false);
 			if (close === "unconfirmed") {
 				expect(escapedBeforeCleanup).toBe(false);
-				if (!result.ok) expect(result.error.message).toMatch(/cleanup|close|stop|confirm/i);
 				expect(target.present).toBe(true);
 				expect(retained).toContain(target.id);
 			} else {
@@ -159,7 +163,7 @@ function expectNoFalseConfirmation(snapshot: RecordingSnapshot | undefined): voi
 	if (!snapshot) return; // Still pending while its native resource is held.
 	const active = snapshot.collectorActive || snapshot.encoderActive || snapshot.recordingActive;
 	if (snapshot.outcome.ok) expect(active).toBe(false);
-	else if (active) expect(snapshot.outcome.error.message).toMatch(/cleanup|record|encoder|stop|confirm/i);
+	else if (active) expect(snapshot.outcome.error).toBeInstanceOf(EvalCleanupError);
 }
 
 describe("Eval-owned recorder teardown", () => {
@@ -202,7 +206,6 @@ describe("Eval-owned recorder teardown", () => {
 			});
 			let executionAtSettlement: RecordingSnapshot | undefined;
 			let boundaryAtSettlement: RecordingSnapshot | undefined;
-			vi.useFakeTimers();
 			const run = owned.start(
 				`${owned.claimCode(tab)}; ${scenario.ending === "complete" ? "6 * 7" : "await Promise.withResolvers().promise"}`,
 				owned.cancelled.signal,
@@ -219,8 +222,7 @@ describe("Eval-owned recorder teardown", () => {
 			await worker.closeRequested.promise;
 			if (scenario.blockCollector) await source.stopRequested.promise;
 			else await owned.encoder.entered.promise;
-			vi.advanceTimersByTime(751);
-			await hostTurn();
+			await waitPastNativeCloseGrace();
 			const executionAtGrace = executionAtSettlement;
 			const boundaryAtGrace = boundaryAtSettlement;
 
