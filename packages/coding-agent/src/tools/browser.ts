@@ -431,12 +431,6 @@ async function openBrowser(
 	}
 	const autoTern = resolved.kind === "tern" && params.app?.tern !== true && params.app?.target === undefined;
 	const existing = getTab(name);
-	if (existing?.backend === "worker" && existing.evalOwnership) {
-		if (existing.evalOwnership.ownerGeneration !== context.evalOwner) {
-			throw new ToolError("Eval-owned browser tab belongs to another or completed Eval");
-		}
-		if (params.persist) throw new ToolError("Eval-owned browser tabs cannot be made persistent");
-	}
 	const kind = autoTern && existing && existing.kindTag !== "tern" ? existing.browser.kind : resolved;
 	let owned: EvalOwnedOpen | undefined;
 	if (params.lifetime === "eval" && context.registerCleanup) {
@@ -467,7 +461,7 @@ async function openBrowser(
 	}
 	const startedAt = performance.now();
 	try {
-		return await openOnKind(session, name, params, details, kind, timeoutMs, [], signal, owned);
+		return await openOnKind(session, name, params, details, kind, timeoutMs, [], signal, owned, context.evalOwner);
 	} catch (error) {
 		if (owned && error instanceof BrowserCleanupError) owned.failure = error;
 		if (kind.kind !== "tern" || !autoTern || !isTernUnavailable(error) || signal?.aborted) throw error;
@@ -487,6 +481,7 @@ async function openBrowser(
 			[note],
 			signal,
 			owned,
+			context.evalOwner,
 		);
 	} finally {
 		owned?.finished.resolve();
@@ -503,6 +498,7 @@ async function openOnKind(
 	notes: readonly string[],
 	signal?: AbortSignal,
 	owned?: EvalOwnedOpen,
+	evalOwner?: string,
 ): Promise<AgentToolResult<unknown>> {
 	const downloadsPath = params.downloads === undefined ? undefined : resolveToCwd(params.downloads, session.cwd);
 	details.browser = kind.kind;
@@ -566,19 +562,6 @@ async function openOnKind(
 			const initScripts = await untilAborted(openSignal, () =>
 				resolveInitScriptSources(params.init_scripts, session.cwd),
 			);
-			// Worker-init options cannot be applied to a live tab: recycle it so the
-			// reopened tab starts with them.
-			if (
-				existing &&
-				(initScripts.length > 0 ||
-					params.downloads !== undefined ||
-					params.user_agent !== undefined ||
-					params.ignore_https_errors === true)
-			) {
-				stage = `closing tab ${JSON.stringify(name)} to reopen it`;
-				await untilAborted(openSignal, () => releaseTab(name, { kill: false, timeoutMs }));
-				stage = `opening tab ${JSON.stringify(name)}`;
-			}
 			const acquire = () =>
 				acquireTab(name, browser, {
 					url: params.url,
@@ -604,6 +587,7 @@ async function openOnKind(
 					// Omitted stays undefined: creation defaults it to false
 					// while reuse by the owner leaves a set value alone.
 					persist: params.persist,
+					evalOwner: owned?.ownerGeneration ?? evalOwner,
 					requireNewOwnedPage: params.lifetime === "eval",
 					onCreated: owned
 						? async tab => {

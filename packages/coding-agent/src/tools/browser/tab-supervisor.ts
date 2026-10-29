@@ -208,6 +208,8 @@ export interface AcquireTabOptions {
 	 * extend another session's tab lifetime.
 	 */
 	persist?: boolean;
+	/** Trusted Eval generation requesting this acquisition, never a browser argument. */
+	evalOwner?: string;
 	/** Fail before reuse/adoption; used only by an Eval-owned open. */
 	requireNewOwnedPage?: boolean;
 	/** Register exact ownership before navigation or returning a handle. */
@@ -606,7 +608,6 @@ async function acquireTabImpl(
 	)) {
 		throw new ToolError("Eval lifetime requires a new owned managed Chromium or relay page without persist");
 	}
-	killedTabs.delete(name);
 	// Temporary refCount hold so releasing an existing tab on the SAME browser
 	// below cannot drop it to refCount 0 and dispose the instance we are about
 	// to reuse (e.g. reopening the sole tab with a different dialogs policy).
@@ -619,24 +620,44 @@ async function acquireTabImpl(
 	if (opts.requireNewOwnedPage && existing) {
 		throw new ToolError("Eval lifetime requires a new, uniquely named tab");
 	}
+	// Authorize the actual tab after dequeue and worker recovery, before any
+	// reuse mutation or replacement. A host preflight can precede publication.
+	if (existing?.backend === "worker" && existing.evalOwnership) {
+		if (existing.evalOwnership.ownerGeneration !== opts.evalOwner) {
+			throw new ToolError("Eval-owned browser tab belongs to another or completed Eval");
+		}
+		if (opts.persist) throw new ToolError("Eval-owned browser tabs cannot be made persistent");
+	}
+	killedTabs.delete(name);
 	if (existing) {
 		if (existing.browser === browser && existing.state === "alive") {
 			const requestedCmuxSurface = "client" in browser ? (opts.cmuxSurface ?? browser.surface) : undefined;
 			if (existing.backend === "cmux" && existing.cmuxAttachedSurface !== requestedCmuxSurface) {
 				holdBrowser(browser);
 				tempHold = true;
-				await releaseTab(name, { kill: false });
+				await releaseTab(name, { kill: false, expectedTab: existing });
 			} else if (opts.dialogs !== undefined && opts.dialogs !== existing.dialogPolicy) {
 				holdBrowser(browser);
 				tempHold = true;
-				await releaseTab(name, { kill: false });
+				await releaseTab(name, { kill: false, expectedTab: existing });
 			} else if (
 				(opts.allowedDomains !== undefined && !sameAllowedDomains(opts.allowedDomains, existing.allowedDomains)) ||
 				(existing.backend === "tern" && opts.target !== undefined && !(await adoptsSameBlock(existing, opts)))
 			) {
 				holdBrowser(browser);
 				tempHold = true;
-				await releaseTab(name, { kill: false });
+				await releaseTab(name, { kill: false, expectedTab: existing });
+			} else if (
+				opts.initScripts?.length ||
+				opts.downloadsPath !== undefined ||
+				opts.userAgent !== undefined ||
+				opts.ignoreHttpsErrors === true
+			) {
+				// Initialization-only options require a fresh page, under the same
+				// serialized authority check as every other replacement reason.
+				holdBrowser(browser);
+				tempHold = true;
+				await releaseTab(name, { kill: false, timeoutMs: opts.timeoutMs, expectedTab: existing });
 			} else {
 				// Reuse counts as use: refresh the idle clock and resume a
 				// settle-frozen page before driving it again. A refused
@@ -715,7 +736,7 @@ async function acquireTabImpl(
 				holdBrowser(browser);
 				tempHold = true;
 			}
-			await releaseTab(name, { kill: false });
+			await releaseTab(name, { kill: false, expectedTab: existing });
 		}
 	}
 
