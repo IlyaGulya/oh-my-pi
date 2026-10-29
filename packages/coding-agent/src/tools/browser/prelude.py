@@ -610,10 +610,13 @@ def _make_browser():
             headed=None,
             timeout=None,
             persist=None,
+            lifetime=None,
         ):
             """Open or attach to a browser tab and return its handle."""
             if name is not None:
                 _require_name(name, "browser.open()")
+            if lifetime == "eval":
+                raise RuntimeError("Eval browser lifetime requires a supported JavaScript Eval run")
             details = await _invoke(
                 "open",
                 {
@@ -632,6 +635,7 @@ def _make_browser():
                     "headed": headed,
                     "timeout": timeout,
                     "persist": persist,
+                    "lifetime": lifetime,
                 },
             )
             opened_name = details.get("name")

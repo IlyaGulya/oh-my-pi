@@ -46,6 +46,8 @@ export type { JsStatusEvent } from "./shared/types";
 export interface ToolBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
+	/** Trusted parent-run registrar; never derived from the per-call signal. */
+	registerCleanup?: (cleanup: () => Promise<void>) => Promise<void>;
 	emitStatus?: (event: JsStatusEvent) => void;
 	identity?: RuntimeCallIdentity;
 	shadowCell?: EvalShadowCellSession;
@@ -221,6 +223,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 					session: options.session,
 					toolCallId,
 					signal: options.signal,
+					registerCleanup: options.registerCleanup,
 					context: options.session.getToolContext?.(),
 				}),
 			);

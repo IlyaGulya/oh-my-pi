@@ -367,6 +367,23 @@ describe("browser facade in real Eval runtimes", () => {
 		expect(calls).toContainEqual({ action: "open", name: "py-opts", timeout: 7, persist: true });
 		expect(calls).toContainEqual({ action: "open", name: "py-plain" });
 	});
+
+	it("rejects Eval-owned browser lifetime in Python instead of returning an unleased handle", async () => {
+		let definitions: readonly EvalPreludeDefinition[] = [];
+		const session = makeSession(() => definitions);
+		definitions = [createBrowserPrelude(session)];
+		const result = await executePython(
+			'await browser.open(name="unsupported-python-lease", lifetime="eval")',
+			{
+				cwd: process.cwd(),
+				sessionId: `browser-facade-py-lifetime-${crypto.randomUUID()}`,
+				toolSession: session,
+				kernelMode: "per-call",
+			},
+		);
+		expect(result.exitCode).toBe(1);
+		expect(result.output).toContain("supported JavaScript Eval");
+	});
 });
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();

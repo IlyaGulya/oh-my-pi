@@ -3,14 +3,24 @@ import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../tools";
 import { denyError, requestApproval, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
 
+/** Native teardown failed: cancellation must not hide an unconfirmed resource stop. */
+export class EvalCleanupError extends AggregateError {
+	constructor(errors: unknown[]) {
+		super(errors, "Eval-owned resource cleanup failed; browser stop is not confirmed");
+		this.name = "EvalCleanupError";
+	}
+}
+
 /** Host context supplied when an eval prelude calls back out of its language VM. */
 export interface EvalPreludeContext {
 	/** Live owning session; authorization is always resolved against its current preludes. */
 	session: ToolSession;
 	/** Tool-call-shaped identifier assigned to this individual host invocation. */
 	toolCallId: string;
-	/** Cancellation signal for the active eval cell. */
+	/** Cancellation signal for this host invocation, not a resource lifetime. */
 	signal?: AbortSignal;
+	/** Present only on Eval surfaces that await cleanup at every run termination boundary. */
+	registerCleanup?: (cleanup: () => Promise<void>) => Promise<void>;
 	/** Ordinary agent tool context used for settings, UI, and provider metadata. */
 	context?: AgentToolContext;
 	/** Progress receiver shared with the active eval call. */

@@ -11,7 +11,7 @@ import { ToolAbortError } from "../../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../bridge-timeout";
-import { getEnabledEvalPreludes } from "../preludes";
+import { EvalCleanupError, getEnabledEvalPreludes } from "../preludes";
 import { attachSessionOwner, EvalKernelNotRunningError, type SessionOwners } from "../executor-base";
 import { shouldDetachKernel } from "../py/spawn-options";
 import { updateEvalState } from "../state";
@@ -86,6 +86,11 @@ interface PendingRun {
 	 */
 	heldResult?: Extract<WorkerOutbound, { type: "result" }>;
 	settled: boolean;
+	/** Allocated only when a prelude actually acquires an Eval-owned resource. */
+	cleanups?: Set<() => Promise<void>>;
+	cleanupClosed?: boolean;
+	cleanupDrain?: Promise<void>;
+	allowCleanup?: boolean;
 }
 
 interface JsSession {
@@ -97,6 +102,7 @@ interface JsSession {
 	packageEnvironment?: string;
 	worker: JsEvalWorkerHandle;
 	state: "alive" | "dead";
+	closing?: Promise<void>;
 	stateSessions: Set<ToolSession>;
 	pending: Map<string, PendingRun>;
 	pendingSnapshots: Map<string, PromiseWithResolvers<Extract<WorkerOutbound, { type: "shadow-snapshot" }>>>;
@@ -161,30 +167,8 @@ export async function executeInVmContext(options: {
 	runState: VmRunState;
 }): Promise<{ value: unknown }> {
 	const { sessionKey } = options;
-	if (options.reset) {
-		// Coalesce concurrent resets: an existing in-flight reset already
-		// produces a fresh context, so a follow-up `reset: true` cell should
-		// just wait for it rather than failing the user-visible call.
-		const inFlight = resettingSessions.get(sessionKey);
-		if (inFlight) await inFlight.catch(() => undefined);
-		else {
-			const resetPromise = resetVmContext(sessionKey);
-			resettingSessions.set(
-				sessionKey,
-				resetPromise.then(() => undefined),
-			);
-			try {
-				await resetPromise;
-			} finally {
-				resettingSessions.delete(sessionKey);
-			}
-		}
-	} else {
-		// Internal coordination: wait for any in-flight reset to settle and
-		// then run on the freshly-rebuilt context.
-		const inFlight = resettingSessions.get(sessionKey);
-		if (inFlight) await inFlight.catch(() => undefined);
-	}
+	if (options.reset) await resetVmContext(sessionKey);
+	else await resettingSessions.get(sessionKey);
 	const session = await acquireSession(
 		sessionKey,
 		{
@@ -382,10 +366,18 @@ export async function runIfSnapshotMatches(options: {
 }
 
 export async function resetVmContext(sessionKey: string): Promise<void> {
-	const session = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.promise.catch(() => undefined));
-	if (!session) return;
-	sessions.delete(sessionKey);
-	await killSession(session, new ToolError("JS context reset"), { force: false });
+	const inFlight = resettingSessions.get(sessionKey);
+	if (inFlight) return await inFlight;
+	const reset = (async () => {
+		const session = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.promise.catch(() => undefined));
+		if (session) await killSessionFor(session, new ToolError("JS context reset"), { force: false });
+	})();
+	resettingSessions.set(sessionKey, reset);
+	try {
+		await reset;
+	} finally {
+		if (resettingSessions.get(sessionKey) === reset) resettingSessions.delete(sessionKey);
+	}
 }
 
 export async function disposeAllVmContexts(): Promise<void> {
@@ -397,8 +389,7 @@ export async function disposeAllVmContexts(): Promise<void> {
 		if (result.status !== "fulfilled") continue;
 		if (!all.includes(result.value)) all.push(result.value);
 	}
-	sessions.clear();
-	await Promise.all(all.map(session => killSession(session, new ToolError("JS context disposed"), { force: false })));
+	await Promise.all(all.map(session => killSessionFor(session, new ToolError("JS context disposed"), { force: false })));
 }
 
 /**
@@ -425,18 +416,14 @@ export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
 		}
 		starting.ownerIds.delete(ownerId);
 	}
-	for (const session of toKill) {
-		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
-	}
 	const started = await Promise.allSettled(startingToKill.map(starting => starting.promise));
 	for (const result of started) {
 		if (result.status !== "fulfilled") continue;
 		const session = result.value;
-		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
 		toKill.push(session);
 	}
 	await Promise.all(
-		toKill.map(session => killSession(session, new ToolError("JS context disposed"), { force: false })),
+		toKill.map(session => killSessionFor(session, new ToolError("JS context disposed"), { force: false })),
 	);
 }
 
@@ -512,6 +499,7 @@ async function runOnce(
 		deferDepth: 0,
 		aborted: false,
 		settled: false,
+		allowCleanup: true,
 	};
 	session.pending.set(runId, pending);
 
@@ -523,6 +511,9 @@ async function runOnce(
 		// phases that had already started.
 		pending.aborted = true;
 		for (const ctrl of pending.toolCalls.values()) ctrl.abort(abortError);
+		// Native resources need not outlive a shielded repository operation.
+		// killSession later joins this same drain and reports any failure.
+		void drainRunCleanup(pending)?.catch(() => undefined);
 		// A critical host phase ignores its abort once started (isolation
 		// worktree setup, merge/cherry-pick). Killing the worker now would
 		// settle the cell on top of a git operation still in progress, so wait
@@ -530,10 +521,10 @@ async function runOnce(
 		// code, hence it stays the terminal step either way.
 		const drained = pending.deferDepth > 0 ? pending.deferDrained?.promise : undefined;
 		if (drained) {
-			void drained.then(() => killSessionFor(session, abortError, { force: true }));
+			void drained.then(() => killSessionFor(session, abortError, { force: true })).catch(() => undefined);
 			return;
 		}
-		void killSessionFor(session, abortError, { force: true });
+		void killSessionFor(session, abortError, { force: true }).catch(() => undefined);
 	};
 
 	if (options.runState.signal?.aborted) {
@@ -582,8 +573,13 @@ async function runOnce(
 		}
 		return await promise;
 	} finally {
-		options.runState.signal?.removeEventListener("abort", onAbort);
-		session.pending.delete(runId);
+		try {
+			const cleanup = drainRunCleanup(pending);
+			if (cleanup) await cleanup;
+		} finally {
+			options.runState.signal?.removeEventListener("abort", onAbort);
+			session.pending.delete(runId);
+		}
 	}
 }
 
@@ -595,6 +591,7 @@ async function acquireSession(
 	ownerId?: string,
 ): Promise<JsSession> {
 	const existing = sessions.get(sessionKey);
+	if (existing?.closing) await existing.closing;
 	if (existing && existing.state === "alive") {
 		existing.sessionId = snapshot.sessionId;
 		existing.cwd = snapshot.cwd;
@@ -714,7 +711,7 @@ async function initWorker(session: JsSession, snapshot: SessionSnapshot, timeout
 		// Worker died after a successful handshake: tear the session down so the
 		// in-flight run (and the next acquire) fail fast instead of hanging on a
 		// worker that will never reply.
-		void killSessionFor(session, error, { force: true });
+		void killSessionFor(session, error, { force: true }).catch(() => undefined);
 	});
 	try {
 		// Attach listeners and send init before awaiting ready. The worker now
@@ -812,6 +809,9 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 		const value = await callSessionTool(msg.name, msg.args, {
 			session: pending.toolSession,
 			signal: ctrl.signal,
+			registerCleanup: pending.allowCleanup && msg.name === "__prelude__"
+				? cleanup => registerRunCleanup(pending, cleanup)
+				: undefined,
 			identity: msg.identity,
 			shadowCell: pending.shadowCell,
 			emitStatus: (event: JsStatusEvent) => {
@@ -832,15 +832,50 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 	}
 }
 
-/** Deliver a worker `result` to the waiting {@link runOnce}. */
+/** Register before exposing a resource; a late acquisition closes itself instead. */
+async function registerRunCleanup(pending: PendingRun, cleanup: () => Promise<void>): Promise<void> {
+	if (pending.cleanupClosed || pending.aborted || pending.settled) {
+		try {
+			await cleanup();
+		} catch (error) {
+			// The original cell may already be gone; retain a visible, privacy-safe failure.
+			logger.error("Late Eval-owned resource cleanup failed; browser stop is not confirmed");
+			throw new EvalCleanupError([error]);
+		}
+		throw new ToolError("Eval ended before its resource could be acquired");
+	}
+	(pending.cleanups ??= new Set()).add(cleanup);
+}
+
+function drainRunCleanup(pending: PendingRun): Promise<void> | undefined {
+	pending.cleanupClosed = true;
+	if (pending.cleanupDrain) return pending.cleanupDrain;
+	if (!pending.cleanups) return undefined;
+	const cleanups = pending.cleanups;
+	pending.cleanups = undefined;
+	pending.cleanupDrain = (async () => {
+		const results = await Promise.allSettled(Array.from(cleanups, cleanup => Promise.resolve().then(cleanup)));
+		const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+		if (errors.length > 0) {
+			throw new EvalCleanupError(errors);
+		}
+	})();
+	return pending.cleanupDrain;
+}
+
+/** Deliver a result only after its owned resources have finished teardown. */
 function finishPending(pending: PendingRun, msg: Extract<WorkerOutbound, { type: "result" }>): void {
 	pending.settled = true;
 	pending.heldResult = undefined;
-	if (msg.ok) {
-		pending.resolve({ value: msg.value });
-		return;
-	}
-	pending.reject(errorFromPayload(msg.error));
+	const cleanup = drainRunCleanup(pending);
+	if (cleanup) void cleanup.then(() => deliverPendingResult(pending, msg), pending.reject);
+	else deliverPendingResult(pending, msg);
+}
+
+function deliverPendingResult(pending: PendingRun, msg: Extract<WorkerOutbound, { type: "result" }>): void {
+	if (pending.aborted) return;
+	if (msg.ok) pending.resolve({ value: msg.value });
+	else pending.reject(errorFromPayload(msg.error));
 }
 
 function settlePending(session: JsSession, msg: Extract<WorkerOutbound, { type: "result" }>): void {
@@ -862,35 +897,54 @@ function settlePending(session: JsSession, msg: Extract<WorkerOutbound, { type: 
 }
 
 async function killSessionFor(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
-	if (sessions.get(session.sessionKey) === session) {
-		sessions.delete(session.sessionKey);
+	try {
+		await killSession(session, error, options);
+	} finally {
+		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
 	}
-	await killSession(session, error, options);
 }
 
-async function killSession(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
-	if (session.state === "dead") return;
+function killSession(session: JsSession, error: Error, options: { force: boolean }): Promise<void> {
+	if (session.closing) return session.closing;
 	session.state = "dead";
 	for (const toolSession of session.stateSessions) {
 		updateEvalState(toolSession, { language: "js", kernelId: session.kernelId, alive: false });
 	}
 	for (const pending of session.pending.values()) {
-		if (pending.settled) continue;
+		pending.aborted = true;
 		pending.settled = true;
 		for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
-		pending.reject(error);
 	}
-	session.pending.clear();
-	for (const pending of session.pendingSnapshots.values()) pending.reject(error);
-	session.pendingSnapshots.clear();
-	for (const pending of session.pendingShadowRuns.values()) pending.reject(error);
-	session.pendingShadowRuns.clear();
-	if (options.force) {
-		await session.worker.terminate().catch(() => undefined);
-		return;
-	}
-	if (await session.worker.close().catch(() => false)) return;
-	await session.worker.terminate().catch(() => undefined);
+	session.closing = (async () => {
+		// Start independent native teardown before waiting for the language worker.
+		let drains: Promise<void>[] | undefined;
+		for (const pending of session.pending.values()) {
+			const cleanup = drainRunCleanup(pending);
+			if (cleanup) {
+				(drains ??= []).push(cleanup.then(
+					() => pending.reject(error),
+					cleanupError => {
+						pending.reject(cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)));
+						throw cleanupError;
+					},
+				));
+			} else pending.reject(error);
+		}
+		const drained = drains ? Promise.allSettled(drains) : undefined;
+		for (const pending of session.pendingSnapshots.values()) pending.reject(error);
+		session.pendingSnapshots.clear();
+		for (const pending of session.pendingShadowRuns.values()) pending.reject(error);
+		session.pendingShadowRuns.clear();
+		if (options.force || !(await session.worker.close().catch(() => false))) {
+			await session.worker.terminate().catch(() => undefined);
+		}
+		session.pending.clear();
+		if (drained) {
+			const errors = (await drained).flatMap(result => result.status === "rejected" ? [result.reason] : []);
+			if (errors.length > 0) throw new EvalCleanupError(errors);
+		}
+	})();
+	return session.closing;
 }
 
 function markJsSessionAlive(session: JsSession, toolSession: ToolSession, environment: string | undefined): void {

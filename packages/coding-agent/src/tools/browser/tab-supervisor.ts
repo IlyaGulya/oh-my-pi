@@ -200,6 +200,10 @@ export interface AcquireTabOptions {
 	 * extend another session's tab lifetime.
 	 */
 	persist?: boolean;
+	/** Fail before reuse/adoption; used only by an Eval-owned open. */
+	requireNewOwnedPage?: boolean;
+	/** Register exact ownership before navigation or returning a handle. */
+	onCreated?: (tab: WorkerTabSession) => Promise<void>;
 }
 
 export interface AcquireTabResult {
@@ -220,6 +224,8 @@ export interface ReleaseTabOptions {
 	kill?: boolean;
 	/** Maximum time for each asynchronous cleanup resource before close fails with diagnostics. */
 	timeoutMs?: number;
+	/** Atomic identity fence: never release a same-name replacement. */
+	expectedTab?: TabSession;
 }
 
 const tabs = new Map<string, TabSession>();
@@ -407,6 +413,12 @@ async function acquireTabImpl(
 	if (opts.signal?.aborted) {
 		throw new ToolAbortError("Browser tab open aborted");
 	}
+	if (opts.requireNewOwnedPage && (
+		opts.persist || opts.target !== undefined ||
+		(browser.kind.kind !== "headless" && browser.kind.kind !== "relay")
+	)) {
+		throw new ToolError("Eval lifetime requires a new owned managed Chromium or relay page without persist");
+	}
 	killedTabs.delete(name);
 	// Temporary refCount hold so releasing an existing tab on the SAME browser
 	// below cannot drop it to refCount 0 and dispose the instance we are about
@@ -417,6 +429,9 @@ async function acquireTabImpl(
 	const reattaching = awaitWorkerRecovery(name, opts, "Browser tab open aborted");
 	if (reattaching) await reattaching;
 	const existing = tabs.get(name);
+	if (opts.requireNewOwnedPage && existing) {
+		throw new ToolError("Eval lifetime requires a new, uniquely named tab");
+	}
 	if (existing) {
 		if (existing.browser === browser && existing.state === "alive") {
 			const requestedCmuxSurface = "client" in browser ? (opts.cmuxSurface ?? browser.surface) : undefined;
@@ -532,6 +547,9 @@ async function acquireTabImpl(
 	let worker: WorkerHandle;
 	try {
 		initPayload = await buildInitPayload(browser, opts);
+		if (opts.requireNewOwnedPage && !ownsPage(initPayload)) {
+			throw new ToolError("Eval lifetime cannot adopt a borrowed browser page");
+		}
 		worker = await spawnTabWorker();
 	} catch (error) {
 		// Failing before the worker took its own hold must release the
@@ -594,7 +612,7 @@ async function acquireTabImpl(
 	// a fresh browser held by nothing but this aborted open is not orphaned in
 	// the registry; a browser still leased/held elsewhere (refCount > 0) is left
 	// for its owner to release.
-	if (opts.signal?.aborted) {
+	if (opts.signal?.aborted && !opts.onCreated) {
 		await worker.terminate().catch(() => undefined);
 		closeAbandonedWorkerPage(browser, worker);
 		if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false }).catch(() => undefined);
@@ -629,6 +647,18 @@ async function acquireTabImpl(
 	// this process dies abnormally before its own teardown closes the tab.
 	const scope = sharedScopeOf(browser);
 	if (scope) void recordSharedTarget(scope, info.targetId);
+	if (opts.onCreated) {
+		try {
+			await opts.onCreated(tab);
+		} catch (error) {
+			await releaseTab(name, { expectedTab: tab });
+			throw error;
+		}
+	}
+	if (opts.onCreated && opts.signal?.aborted) {
+		await releaseTab(name, { expectedTab: tab });
+		throw new ToolAbortError("Browser tab open aborted");
+	}
 	if (opts.url) await navigateOpenedTab(name, opts.url, opts, startedAt, tab);
 	return { tab, created: true };
 }
@@ -686,13 +716,12 @@ async function navigateOpenedTab(
 
 /** Close a tab its failed open created, unless something already replaced or closed it. */
 async function rollBackCreatedTab(name: string, tab: WorkerTabSession): Promise<void> {
-	if (tabs.get(name) !== tab) return;
+	// The identity check belongs inside trusted teardown, not before an await.
 	try {
-		await releaseTab(name, { kill: false });
-	} catch (error) {
-		logger.warn("Failed to close the tab of a failed browser open", {
-			name,
-			error: error instanceof Error ? error.message : String(error),
+		await releaseTab(name, { kill: false, expectedTab: tab });
+	} catch {
+		logger.warn("Failed to close the tab of a failed browser open; stop is not confirmed", {
+			targetId: tab.targetId,
 		});
 	}
 }
@@ -1205,14 +1234,22 @@ async function recoverWorkerTab(
  * first release's outcome.
  */
 const releaseInflight = new WeakMap<TabSession, { promise: Promise<boolean>; opts: ReleaseTabOptions }>();
+// A caught explicit-close failure must remain visible to the owning Eval's drain.
+let releaseFailures: WeakMap<TabSession, unknown> | undefined;
 
 export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Promise<boolean> {
-	const tab = tabs.get(name);
+	const tab = opts.expectedTab ?? tabs.get(name);
 	if (!tab) {
 		logger.debug("releaseTab: unknown tab", { name });
 		return false;
 	}
+	// Join explicit close of this exact object even if its name has since been reused.
+	if (opts.expectedTab && tabs.get(name) !== tab && !releaseInflight.has(tab)) {
+		if (releaseFailures?.has(tab)) throw releaseFailures.get(tab);
+		return false;
+	}
 	const ongoing = releaseInflight.get(tab);
+	if (!ongoing && opts.expectedTab && releaseFailures?.has(tab)) throw releaseFailures.get(tab);
 	if (ongoing) {
 		// Coalesce cleanup strength: a joining disposal must not lose its
 		// kill request to an earlier non-killing close — `releaseBrowser`
@@ -1225,12 +1262,16 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 		// passed `releaseBrowser`: verify a still-running spawned app is
 		// terminated rather than trusting the joined outcome.
 		if (opts.kill) await ensureSpawnedKilled(tab.browser);
+		if (opts.expectedTab && releaseFailures?.has(tab)) throw releaseFailures.get(tab);
 		return joined;
 	}
 	const entry = { promise: releaseTabInner(tab, name, opts), opts };
 	releaseInflight.set(tab, entry);
 	try {
 		return await entry.promise;
+	} catch (error) {
+		(releaseFailures ??= new WeakMap()).set(tab, error);
+		throw error;
 	} finally {
 		releaseInflight.delete(tab);
 	}
@@ -1301,7 +1342,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		} catch (error) {
 			closeError ??= error;
 		} finally {
-			tabs.delete(name);
+			if (tabs.get(name) === tab) tabs.delete(name);
 		}
 		if (closeError) throw closeError;
 		return true;
@@ -1335,7 +1376,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		} catch (error) {
 			closeError ??= error;
 		} finally {
-			tabs.delete(name);
+			if (tabs.get(name) === tab) tabs.delete(name);
 		}
 		if (closeError) throw closeError;
 		return true;
@@ -1382,7 +1423,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 	} catch (error) {
 		cleanupError ??= error;
 	} finally {
-		tabs.delete(name);
+		if (tabs.get(name) === tab) tabs.delete(name);
 		const scope = sharedScopeOf(tab.browser);
 		if (scope) {
 			if (targetCloseFailed) {
@@ -1400,12 +1441,12 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		} else if (targetCloseFailed) {
 			// Nothing here can retry it; a relay closes a tab of an offline browser once that browser reconnects.
 			logger.warn("Could not confirm a browser tab omp opened was closed; it may still be open", {
-				name,
 				targetId: tab.targetId,
 			});
 		}
 	}
 	if (cleanupError) throw cleanupError;
+	if (targetCloseFailed) throw new ToolError("Browser target closure could not be confirmed");
 	return true;
 }
 
@@ -2115,6 +2156,9 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 	releaseInflight.set(tab, entry);
 	try {
 		await entry.promise;
+	} catch (error) {
+		(releaseFailures ??= new WeakMap()).set(tab, error);
+		throw error;
 	} finally {
 		if (releaseInflight.get(tab) === entry) releaseInflight.delete(tab);
 	}
@@ -2125,7 +2169,7 @@ async function forceKillSurfaceTab(tab: CmuxTabSession | TernTabSession, name: s
 	if (tab.backend === "tern")
 		await tab.ternTab.close({ timeoutMs: DEFAULT_TAB_CLOSE_TIMEOUT_MS }).catch(() => undefined);
 	await releaseBrowser(tab.browser, { kill: false });
-	tabs.delete(name);
+	if (tabs.get(name) === tab) tabs.delete(name);
 }
 
 /**
@@ -2151,11 +2195,14 @@ async function forceKillTabTeardown(tab: WorkerTabSession): Promise<void> {
 		).catch(() => false);
 	}
 	await releaseBrowser(tab.browser, { kill: false });
-	tabs.delete(tab.name);
+	if (tabs.get(tab.name) === tab) tabs.delete(tab.name);
 	const scope = sharedScopeOf(tab.browser);
 	if (scope) {
 		if (targetClosed) void forgetSharedTarget(scope, tab.targetId);
 		else recheckSharedBrowser(scope);
+	}
+	if (!targetClosed) {
+		(releaseFailures ??= new WeakMap()).set(tab, new ToolError("Browser target closure could not be confirmed"));
 	}
 }
 

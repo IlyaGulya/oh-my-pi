@@ -7,6 +7,7 @@ import {
 } from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent, withBridgeTimeoutPause } from "../bridge-timeout";
 import { DisplayOutputCollector } from "../executor-base";
+import { EvalCleanupError } from "../preludes";
 import type { EvalDisplayOutput } from "../types";
 import { executeInVmContext } from "./context-manager";
 import { installJsPackages } from "./package-installer";
@@ -206,6 +207,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 	} catch (error) {
 		const activeSignal = packageWorkComplete ? signal : packageSignal;
 		if (activeSignal?.aborted || isAbortError(error)) {
+			if (error instanceof EvalCleanupError) outputSink.push(`${error.message}\n`);
 			const timedOut = packageWorkComplete
 				? Boolean(timeoutSignal?.aborted) || isTimeoutReason(options.signal?.reason)
 				: isTimeoutReason(packageSignal?.reason);

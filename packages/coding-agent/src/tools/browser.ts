@@ -142,6 +142,7 @@ const browserSchema = type({
 	"all?": type("boolean").describe("release every managed tab"),
 	"kill?": type("boolean").describe("also kill spawned-app browsers"),
 	"persist?": type("boolean").describe("keep tab live across turn settle and idle close"),
+	"lifetime?": type("'session' | 'eval'").describe("session by default; eval closes a new owned page when its JavaScript Eval ends"),
 });
 
 type BrowserParams = typeof browserSchema.infer;
@@ -334,7 +335,7 @@ async function invokeBrowser(
 
 		switch (parsed.action) {
 			case "open":
-				return await openBrowser(session, name, parsed, details, timeoutMs, context.signal);
+				return await openBrowser(session, name, parsed, details, timeoutMs, context.signal, context.registerCleanup);
 			case "close":
 				return await closeBrowser(name, parsed, details, timeoutMs, context.signal);
 			case "tabs":
@@ -369,14 +370,24 @@ async function openBrowser(
 	details: BrowserPreludeDetails,
 	timeoutMs: number,
 	signal?: AbortSignal,
+	registerCleanup?: EvalPreludeContext["registerCleanup"],
 ): Promise<AgentToolResult<unknown>> {
+	if (params.lifetime === "eval") {
+		if (!registerCleanup) throw new ToolError("Eval browser lifetime requires a supported JavaScript Eval run");
+		if (params.persist) throw new ToolError("Eval browser lifetime cannot be combined with persist: true");
+		if (params.app?.target !== undefined) throw new ToolError("Eval browser lifetime cannot adopt a user page");
+		if (getTab(name)) throw new ToolError("Eval lifetime requires a new, uniquely named tab");
+	}
 	const resolved = resolveBrowserKind(params, session);
+	if (params.lifetime === "eval" && resolved.kind !== "headless" && resolved.kind !== "relay") {
+		throw new ToolError("Eval browser lifetime supports only new managed Chromium or relay pages");
+	}
 	const autoTern = resolved.kind === "tern" && params.app?.tern !== true && params.app?.target === undefined;
 	const existing = getTab(name);
 	const kind = autoTern && existing && existing.kindTag !== "tern" ? existing.browser.kind : resolved;
 	const startedAt = performance.now();
 	try {
-		return await openOnKind(session, name, params, details, kind, timeoutMs, [], signal);
+		return await openOnKind(session, name, params, details, kind, timeoutMs, [], signal, registerCleanup);
 	} catch (error) {
 		if (kind.kind !== "tern" || !autoTern || !isTernUnavailable(error) || signal?.aborted) throw error;
 		// A Tern tab under this name whose window went away still holds the name: release
@@ -394,6 +405,7 @@ async function openBrowser(
 			remainingMs,
 			[note],
 			signal,
+			registerCleanup,
 		);
 	}
 }
@@ -407,6 +419,7 @@ async function openOnKind(
 	timeoutMs: number,
 	notes: readonly string[],
 	signal?: AbortSignal,
+	registerCleanup?: EvalPreludeContext["registerCleanup"],
 ): Promise<AgentToolResult<unknown>> {
 	const downloadsPath = params.downloads === undefined ? undefined : resolveToCwd(params.downloads, session.cwd);
 	details.browser = kind.kind;
@@ -508,6 +521,13 @@ async function openOnKind(
 					// Omitted stays undefined: creation defaults it to false
 					// while reuse by the owner leaves a set value alone.
 					persist: params.persist,
+					requireNewOwnedPage: params.lifetime === "eval",
+					onCreated: params.lifetime === "eval" && registerCleanup
+						? tab => registerCleanup(async () => {
+							// Independent of both the revoked bridge and its aborted call signal.
+							await releaseTab(name, { expectedTab: tab });
+						})
+						: undefined,
 				}),
 			);
 		} catch (error) {

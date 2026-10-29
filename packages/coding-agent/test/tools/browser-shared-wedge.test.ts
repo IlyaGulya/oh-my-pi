@@ -25,6 +25,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withTimeout } from "@oh-my-pi/pi-utils";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { disposeVmContextsByOwner } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
+import { executeJs } from "@oh-my-pi/pi-coding-agent/eval/js/executor";
+import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
 import type { DaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client";
 import { daemonRuntimeDir } from "@oh-my-pi/pi-coding-agent/launch/paths";
 import type { DaemonOperation } from "@oh-my-pi/pi-coding-agent/launch/protocol";
@@ -255,7 +258,7 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 		await recordSharedTarget(scope, TARGET_ID);
 		getTabsMapForTest().set("logos-b2b", makeWedgeTab(scope, { close: "fail" }));
 
-		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).resolves.toBe(true);
+		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).rejects.toThrow("closure could not be confirmed");
 
 		expect(healthCheck).toHaveBeenCalledTimes(1);
 		expect(await ownedTargets(scope)).toEqual([]);
@@ -387,11 +390,80 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 		await recordSharedTarget(scope, TARGET_ID);
 		getTabsMapForTest().set("logos-b2b", makeWedgeTab(scope, { close: "fail" }));
 
-		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).resolves.toBe(true);
+		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).rejects.toThrow("closure could not be confirmed");
 
 		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
 		expect(healthCheck).toHaveBeenCalledTimes(1);
 	});
+
+	it("retains a caught close failure for the owning lease without closing a same-name replacement", async () => {
+		const scope = trackedScope();
+		spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
+		await recordSharedTarget(scope, TARGET_ID);
+		const original = makeWedgeTab(scope, { close: "fail" });
+		getTabsMapForTest().set("logos-b2b", original);
+		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).rejects.toThrow("closure could not be confirmed");
+		const replacement = makeWedgeTab(scope, { close: "fail" });
+		getTabsMapForTest().set("logos-b2b", replacement);
+		await expect(releaseTab("logos-b2b", { expectedTab: original, timeoutMs: 60 })).rejects.toThrow("closure could not be confirmed");
+		expect(getTabsMapForTest().get("logos-b2b")).toBe(replacement);
+		expect(replacement.state).toBe("alive");
+		expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
+	});
+
+	it("reports an unconfirmed native stop even when caller cancellation is already active", async () => {
+		const scope = trackedScope();
+		await fs.mkdir(scope.projectDir, { recursive: true });
+		spyOn(sharedDaemon, "stopSharedBrowserIfUnreachable").mockResolvedValue(false);
+		await recordSharedTarget(scope, TARGET_ID);
+		const tab = makeWedgeTab(scope, { close: "fail" });
+		getTabsMapForTest().set("logos-b2b", tab);
+		const ownerId = `failed-cleanup-${crypto.randomUUID()}`;
+		const armed = Promise.withResolvers<void>();
+		const prelude: EvalPreludeDefinition = {
+			name: "nativeCleanup",
+			documentation: "Native cleanup failure fixture",
+			javascript: "",
+			python: "",
+			exports: [],
+			async invoke(_parameters, context) {
+				if (!context.registerCleanup) throw new Error("Missing owning Eval run");
+				await context.registerCleanup(async () => {
+					await releaseTab("logos-b2b", { expectedTab: tab, timeoutMs: 60 });
+				});
+				armed.resolve();
+				return { content: [] };
+			},
+		};
+		const session: ToolSession = {
+			...makeSession(),
+			cwd: scope.projectDir,
+			getEvalPreludes: () => [prelude],
+		};
+		const controller = new AbortController();
+		try {
+			const run = executeJs('await __omp_prelude__("nativeCleanup", {}); await Bun.sleep(60_000)', {
+				sessionId: ownerId,
+				kernelOwnerId: ownerId,
+				cwd: scope.projectDir,
+				session,
+				signal: controller.signal,
+			});
+			await Promise.race([
+				armed.promise,
+				run.then(() => { throw new Error("Eval finished before acquiring its native resource"); }),
+			]);
+			controller.abort(new Error("caller cancelled"));
+			const result = await run;
+			expect(result.cancelled).toBe(true);
+			expect(result.output).toContain("browser stop is not confirmed");
+			expect(await ownedTargets(scope)).toEqual([TARGET_ID]);
+		} finally {
+			controller.abort();
+			await disposeVmContextsByOwner(ownerId).catch(() => undefined);
+			await fs.rm(scope.projectDir, { recursive: true, force: true });
+		}
+	}, 30_000);
 });
 
 describe("shared browser reachability check", () => {
