@@ -125,6 +125,8 @@ export interface ReadyInfo {
 	targetId: string;
 	/** Native close acknowledgement semantics supported by this worker. */
 	cleanupVersion?: 1;
+	/** Includes in-flight recorder start/finalization, not just active capture. */
+	recordingQuiescent?: boolean;
 }
 
 export interface RunResultOk {
@@ -177,6 +179,8 @@ export type WorkerOutbound =
 	| { type: "result"; id: string; ok: true; payload: RunResultOk }
 	| { type: "result"; id: string; ok: false; error: RunErrorPayload }
 	| { type: "tool-call"; id: string; runId: string; name: string; args: unknown }
+	/** Recorder and all start/finalization operations are quiescent, not merely inactive. */
+	| { type: "recording-state"; quiescent: boolean }
 	| { type: "log"; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> }
 	| { type: "closed"; cleanup?: BrowserCleanupReport };
 

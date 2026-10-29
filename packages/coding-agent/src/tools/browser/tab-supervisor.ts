@@ -76,6 +76,10 @@ interface WorkerHandle {
 	onExit(handler: (exitCode: number) => void): () => void;
 	terminate(): Promise<void>;
 	readonly mode: "worker" | "inline";
+	/** Confirmed by the isolated worker's close event, never by requesting termination. */
+	readonly exited?: boolean;
+	/** Undefined is unknown; true excludes pending recorder start/finalization as well as active capture. */
+	readonly recordingQuiescent?: boolean;
 }
 
 export type DialogPolicy = "accept" | "dismiss";
@@ -359,16 +363,23 @@ async function closeNativeWorkerImpl(
 	preservePage = false,
 ): Promise<void> {
 	preservePage &&= retainedCleanups?.get(worker)?.preservePage ?? true;
-	const close = requestNativeClose(worker, browser, timeoutMs, preservePage);
-	try {
-		await withTimeout(close.promise, timeoutMs + GRACE_MS, "Native browser cleanup acknowledgement timed out");
-	} catch {
-		// A timeout never authorizes terminating a worker with an unconfirmed encoder.
-	}
 	const tab = "backend" in owner ? owner : undefined;
+	// An exited ordinary worker cannot answer a new close request. Its last
+	// affirmative recorder checkpoint plus actual exit permits retirement, not
+	// a fabricated acknowledgement. Never waive an existing close's uncertainty.
+	const exitedQuiescent = tab !== undefined && !tab.evalOwnership && worker.mode === "worker" &&
+		worker.exited === true && worker.recordingQuiescent === true && !nativeCloses.has(worker);
+	const close = exitedQuiescent ? undefined : requestNativeClose(worker, browser, timeoutMs, preservePage);
+	if (close) {
+		try {
+			await withTimeout(close.promise, timeoutMs + GRACE_MS, "Native browser cleanup acknowledgement timed out");
+		} catch {
+			// A timeout never authorizes terminating a worker with an unconfirmed encoder.
+		}
+	}
 	const owns = "backend" in owner ? owner.ownsPage : ownsPage(owner);
 	const knownTarget = "backend" in owner ? owner.targetId : owner.mode === "attach" && owner.page.kind !== "create" ? owner.page.targetId : undefined;
-	const targetId = owns ? (knownTarget ?? workerPageTargets.get(worker) ?? close.report?.targetId) : undefined;
+	const targetId = owns ? (knownTarget ?? workerPageTargets.get(worker) ?? close?.report?.targetId) : undefined;
 	const scope = sharedScopeOf(browser);
 	let targetClosed = preservePage || !owns;
 	if (targetId && !preservePage) {
@@ -378,11 +389,12 @@ async function closeNativeWorkerImpl(
 		} catch {
 			targetClosed = false;
 		}
-	} else if (close.report && !close.report.issues.some(issue => issue.state === "unconfirmed")) {
+	} else if (close?.report && !close.report.issues.some(issue => issue.state === "unconfirmed")) {
 		// A quiescent worker which created no page has no owned target to close.
 		targetClosed = true;
 	}
-	const issues: BrowserCleanupIssue[] = close.report ? close.report.issues.map(issue => ({ ...issue })) : [{ resource: "worker", state: "unconfirmed" }];
+	const issues: BrowserCleanupIssue[] = close?.report ? close.report.issues.map(issue => ({ ...issue })) :
+		exitedQuiescent ? [] : [{ resource: "worker", state: "unconfirmed" }];
 	let workerStopped = !issues.some(issue => issue.state === "unconfirmed");
 	if (workerStopped) {
 		try {
@@ -2494,20 +2506,31 @@ async function spawnTabWorker(): Promise<WorkerHandle> {
 
 function wrapBunWorker(worker: Worker): WorkerHandle {
 	let terminated = false;
+	let exited = false;
+	let recordingQuiescent: boolean | undefined;
 	return {
 		mode: "worker",
+		get exited() { return exited; },
+		get recordingQuiescent() { return recordingQuiescent; },
 		send(msg, transferList) {
 			worker.postMessage(msg, { transfer: transferList ?? [] });
 		},
 		onMessage(handler) {
-			const wrap = (event: MessageEvent): void => handler(event.data as WorkerOutbound);
+			const wrap = (event: MessageEvent): void => {
+				const msg = event.data as WorkerOutbound;
+				if (msg.type === "recording-state") recordingQuiescent = msg.quiescent;
+				else if (msg.type === "ready") recordingQuiescent = msg.info.recordingQuiescent;
+				handler(msg);
+			};
 			worker.addEventListener("message", wrap);
 			return () => worker.removeEventListener("message", wrap);
 		},
 		onError(handler) {
 			const onError = (event: ErrorEvent): void => handler(errorFromWorkerEvent(event));
-			const onMessageError = (event: MessageEvent): void =>
+			const onMessageError = (event: MessageEvent): void => {
+				recordingQuiescent = undefined;
 				handler(new WorkerMessageError(`Tab worker message error: ${String(event.data)}`));
+			};
 			worker.addEventListener("error", onError);
 			worker.addEventListener("messageerror", onMessageError);
 			return () => {
@@ -2517,6 +2540,7 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 		},
 		onExit(handler) {
 			const onClose = (event: CloseEvent): void => {
+				exited = true;
 				if (!terminated) handler(event.code);
 			};
 			worker.addEventListener("close", onClose);

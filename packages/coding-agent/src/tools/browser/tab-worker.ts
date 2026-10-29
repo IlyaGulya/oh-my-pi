@@ -1530,6 +1530,7 @@ export class WorkerCore {
 	#screenshotHistory = new Map<string, ScreenshotHistory>();
 	#webmcp?: WebMcpController;
 	readonly #recording = new RecordingController();
+	#recordingOps = 0;
 	#initializing?: Promise<void>;
 	#closing?: Promise<void>;
 	#retiring = false;
@@ -1906,6 +1907,7 @@ export class WorkerCore {
 				: await this.#viewport().catch(() => this.#lastViewport ?? DEFAULT_VIEWPORT),
 			targetId,
 			cleanupVersion: BROWSER_EVAL_LIFETIME_VERSION,
+			recordingQuiescent: this.#recordingOps === 0 && !this.#recording.status().active,
 		};
 	}
 
@@ -1928,7 +1930,9 @@ export class WorkerCore {
 
 	async #postReadyInfo(): Promise<void> {
 		try {
-			this.#transport.send({ type: "ready", info: await this.#currentReadyInfo() });
+			const info = await this.#currentReadyInfo();
+			info.recordingQuiescent = this.#recordingOps === 0 && !this.#recording.status().active;
+			this.#transport.send({ type: "ready", info });
 		} catch (error) {
 			this.#log("debug", "Failed to refresh tab info", {
 				error: error instanceof Error ? error.message : String(error),
@@ -2315,6 +2319,24 @@ export class WorkerCore {
 		}
 	}
 
+	#postRecordingState(): void {
+		this.#transport.send({
+			type: "recording-state",
+			quiescent: this.#recordingOps === 0 && !this.#recording.status().active,
+		});
+	}
+
+	async #recordingOp<T>(operation: () => Promise<T>): Promise<T> {
+		this.#recordingOps++;
+		this.#postRecordingState();
+		try {
+			return await operation();
+		} finally {
+			this.#recordingOps--;
+			this.#postRecordingState();
+		}
+	}
+
 	#createTabApi(
 		name: string,
 		timeoutMs: number,
@@ -2667,19 +2689,19 @@ export class WorkerCore {
 				),
 			recordStart: (destination, opts) =>
 				op(`tab.recordStart(${JSON.stringify(destination)})`, quickOpMs, sig =>
-					this.#recording.start(createCdpRecordingSource(page), destination, session.cwd, opts, sig),
+					this.#recordingOp(() => this.#recording.start(createCdpRecordingSource(page), destination, session.cwd, opts, sig)),
 				),
 			recordStop: () =>
 				op("tab.recordStop()", budgetBound, sig =>
-					this.#recording.stop({ signal: sig, output, excludeWebP: session.excludeWebP }),
+					this.#recordingOp(() => this.#recording.stop({ signal: sig, output, excludeWebP: session.excludeWebP })),
 				),
 			recordRestart: (destination, opts) =>
 				op(`tab.recordRestart(${JSON.stringify(destination)})`, budgetBound, sig =>
-					this.#recording.restart(createCdpRecordingSource(page), destination, session.cwd, opts, {
+					this.#recordingOp(() => this.#recording.restart(createCdpRecordingSource(page), destination, session.cwd, opts, {
 						signal: sig,
 						output,
 						excludeWebP: session.excludeWebP,
-					}),
+					})),
 				),
 			recording: () => op("tab.recording()", quickOpMs, () => Promise.resolve(this.#recording.status())),
 			webmcpList: opts => op("tab.webmcpList()", quickOpMs, sig => untilAborted(sig, () => webmcp.list(opts))),

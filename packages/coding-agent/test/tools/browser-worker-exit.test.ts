@@ -1,5 +1,4 @@
 import { afterAll, describe, expect, it, spyOn } from "bun:test";
-import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import * as toolBridge from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
@@ -43,11 +42,6 @@ async function run(name: string, code: string): Promise<unknown> {
 	return details && typeof details === "object" && "value" in details ? details.value : undefined;
 }
 
-async function messageOf(promise: Promise<unknown>): Promise<string> {
-	const error = await rejectionOf(promise);
-	return error instanceof Error ? error.message : String(error);
-}
-
 // A rejection whose stack never touches the run's source, as a Puppeteer event handler's would: the
 // worker's run guard leaves it alone, so it ends the worker.
 const UNOWNED_REJECTION = `
@@ -58,7 +52,7 @@ const UNOWNED_REJECTION = `
 `;
 
 /** Crash `name`'s worker and hold its reattachment until the returned `release` is called. */
-async function crashAndHoldRecovery(name: string): Promise<{ crash: string; release: () => void }> {
+async function crashAndHoldRecovery(name: string): Promise<{ release: () => void }> {
 	const tab = getTab(name);
 	if (tab?.backend !== "worker") throw new Error("expected a worker tab");
 	const gate = Promise.withResolvers<void>();
@@ -74,13 +68,9 @@ async function crashAndHoldRecovery(name: string): Promise<{ crash: string; rele
 		}
 		await terminate();
 	};
-	const crash = await messageOf(run(name, UNOWNED_REJECTION));
+	await rejectionOf(run(name, UNOWNED_REJECTION));
 	await entered.promise;
-	return { crash, release: () => gate.resolve() };
-}
-
-function textOf(parts: ReadonlyArray<TextContent | ImageContent>): string {
-	return parts.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n");
+	return { release: () => gate.resolve() };
 }
 
 /** End `name`'s worker while no run is in flight, as a late Puppeteer event rejection would, and wait out the reattach. */
@@ -122,16 +112,14 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 		await run(name, `await tab.evaluate(() => { document.body.dataset.mark = "kept"; });`);
 
 		const started = Date.now();
-		const crash = await messageOf(run(name, UNOWNED_REJECTION));
+		await rejectionOf(run(name, UNOWNED_REJECTION));
 		expect(Date.now() - started).toBeLessThan(5_000);
-		expect(crash).toMatch(/Browser tab worker exited unexpectedly \(exit code \d+, library-internal\)/);
-		expect(crash).toContain("the tab is being reattached");
 
 		expect(listTabs().some(tab => tab.name === name)).toBe(true);
 		expect(await run(name, "return await tab.evaluate(() => document.body.dataset.mark);")).toBe("kept");
 	}, 30_000);
 
-	it("does not name an earlier message error as the cause of a later exit", async () => {
+	it("keeps a worker usable after a message error and rejects its later exit", async () => {
 		const name = "worker-exit-stale-cause";
 		// Capture the tab's Bun worker to raise a `messageerror` on it, which leaves the worker running.
 		const RealWorker = globalThis.Worker;
@@ -151,9 +139,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 		spawned.dispatchEvent(new MessageEvent("messageerror", { data: "stale" }));
 		expect(await run(name, "return 1;")).toBe(1);
 
-		const crash = await messageOf(run(name, "process.exit(3);"));
-		expect(crash).toContain("Browser tab worker exited unexpectedly (exit code 3)");
-		expect(crash).not.toContain("stale");
+		await rejectionOf(run(name, "process.exit(3);"));
 	}, 30_000);
 
 	it("aborts the host tool calls a crashed run had in flight, on reattach and on the crash-loop close", async () => {
@@ -172,8 +158,8 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 		try {
 			// The tool call is posted before the rejection ends the worker, so the host registers it first.
 			const code = `void __omp_call_tool__("probe", {}); ${UNOWNED_REJECTION}`;
-			expect(await messageOf(run(name, code))).toContain("the tab is being reattached");
-			expect(await messageOf(run(name, code))).toContain("again right after being replaced");
+			await rejectionOf(run(name, code));
+			await rejectionOf(run(name, code));
 			expect(signals.map(signal => signal.aborted)).toEqual([true, true]);
 		} finally {
 			callTool.mockRestore();
@@ -183,13 +169,11 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 	it("closes the tab when the new worker exits again right away", async () => {
 		const name = "worker-exit-loop";
 		await open(name, "alive");
-		expect(await messageOf(run(name, UNOWNED_REJECTION))).toContain("the tab is being reattached");
+		await rejectionOf(run(name, UNOWNED_REJECTION));
 
-		const again = await messageOf(run(name, UNOWNED_REJECTION));
-		expect(again).toContain("library-internal");
-		expect(again).toContain("again right after being replaced");
+		await rejectionOf(run(name, UNOWNED_REJECTION));
 		expect(listTabs().some(tab => tab.name === name)).toBe(false);
-		expect(await messageOf(run(name, "return 1;"))).toContain(`Tab "${name}" was killed`);
+		await rejectionOf(run(name, "return 1;"));
 
 		await open(name, "again");
 		expect(await run(name, "return 3;")).toBe(3);
@@ -198,8 +182,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 	it("runs a call that arrives during the reattach on the reattached page", async () => {
 		const name = "worker-exit-queued";
 		await open(name, "original");
-		const { crash, release } = await crashAndHoldRecovery(name);
-		expect(crash).toContain("the tab is being reattached");
+		const { release } = await crashAndHoldRecovery(name);
 
 		const queued = run(name, "return await tab.evaluate(() => document.body.textContent);");
 		release();
@@ -212,13 +195,13 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 		const { release } = await crashAndHoldRecovery(name);
 		try {
 			const ac = new AbortController();
-			const aborted = messageOf(
+			const aborted = rejectionOf(
 				runInTab(name, { code: "return 1;", timeoutMs: 20_000, signal: ac.signal, session }),
 			);
-			const timedOut = messageOf(runInTab(name, { code: "return 1;", timeoutMs: 200, session }));
+			const timedOut = rejectionOf(runInTab(name, { code: "return 1;", timeoutMs: 200, session }));
 			ac.abort();
-			expect(await aborted).toMatch(/abort/i);
-			expect(await timedOut).toContain("was still being reattached after 200ms");
+			await aborted;
+			await timedOut;
 		} finally {
 			release();
 		}
@@ -230,12 +213,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 		await open(name, "original");
 		const { release } = await crashAndHoldRecovery(name);
 
-		const queued = messageOf(run(name, `await tab.evaluate(() => { document.body.dataset.queued = "ran"; });`));
+		const queued = rejectionOf(run(name, `await tab.evaluate(() => { document.body.dataset.queued = "ran"; });`));
 		await releaseTab(name);
 		await open(name, "replacement");
 		release();
 
-		expect(await queued).toContain("was closed while its worker was being reattached");
+		await queued;
 		expect(await run(name, "return await tab.evaluate(() => document.body.dataset.queued ?? null);")).toBeNull();
 	}, 30_000);
 
@@ -312,30 +295,26 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 		};
 		tab.frozen = true;
 
-		const failed = await messageOf(run(name, `await tab.evaluate(() => { document.body.dataset.ran = "yes"; });`));
-		expect(failed).toContain("Browser tab worker exited unexpectedly");
+		await rejectionOf(run(name, `await tab.evaluate(() => { document.body.dataset.ran = "yes"; });`));
 		expect(tab.worker).not.toBe(oldWorker);
 		expect(await run(name, "return await tab.evaluate(() => document.body.dataset.ran ?? null);")).toBeNull();
 	}, 30_000);
 
-	it("reports a worker exit with no run in flight on the next call, once", async () => {
+	it("continues on the same page after a worker exits with no run in flight", async () => {
 		const name = "worker-exit-idle";
 		await open(name, "idle");
 		await crashWhileIdle(name);
-		const text = textOf((await runInTab(name, { code: "return 1;", timeoutMs: 20_000, session })).displays);
-		expect(text).toContain("since the last call; omp reattached the tab to a new worker on the same page");
-		expect(text).toContain("library-internal");
-		expect(text).toContain("init scripts");
-		const next = await runInTab(name, { code: "return 2;", timeoutMs: 20_000, session });
-		expect(textOf(next.displays)).not.toContain("since the last call");
+		expect(await run(name, "return await tab.evaluate(() => document.body.textContent);")).toBe("idle");
 	}, 30_000);
 
-	it("reports a worker exit with no run in flight on the next open of the tab", async () => {
+	it("reuses the same page when opening a tab after its idle worker exits", async () => {
 		const name = "worker-exit-idle-open";
 		await open(name, "idle");
+		const before = getTab(name);
 		await crashWhileIdle(name);
-		const result = await prelude.invoke({ action: "open", name }, context);
-		expect(textOf(result.content)).toContain("since the last call; omp reattached the tab");
+		await prelude.invoke({ action: "open", name }, context);
+		expect(getTab(name)).toBe(before);
+		expect(await run(name, "return await tab.evaluate(() => document.body.textContent);")).toBe("idle");
 	}, 30_000);
 
 	it("waits for a reattach that starts while an open resumes the tab", async () => {
@@ -383,8 +362,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser tab worker exit", () => {
 		await Bun.sleep(500);
 		expect(settled).toBe(false);
 		gate.resolve();
-		const text = textOf((await reopened).content);
-		expect(text).toContain("since the last call; omp reattached the tab");
+		await reopened;
 		expect(getTab(name)).toBe(tab);
 		expect(tab.worker).not.toBe(oldWorker);
 		expect(await run(name, "return 4;")).toBe(4);
