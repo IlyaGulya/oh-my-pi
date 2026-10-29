@@ -10,7 +10,6 @@ import {
 	type JsEvalWorkerHandle,
 	setJsEvalWorkerFactoriesForTests,
 } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
-import { WorkerCore as EvalWorkerCore } from "@oh-my-pi/pi-coding-agent/eval/js/worker-core";
 import type {
 	WorkerInbound as EvalInbound,
 	WorkerOutbound as EvalOutbound,
@@ -35,13 +34,14 @@ import { WorkerCore as BrowserWorkerCore } from "@oh-my-pi/pi-coding-agent/tools
 import * as uploads from "@oh-my-pi/pi-coding-agent/tools/browser/upload-files";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import * as video from "@oh-my-pi/pi-coding-agent/utils/video";
-import { isEnoent, postmortem } from "@oh-my-pi/pi-utils";
+import { isEnoent, untilAborted, workerHostEntry } from "@oh-my-pi/pi-utils";
 import * as puppeteer from "puppeteer-core";
 import type { Browser, CDPSession, Frame, Page, Target } from "puppeteer-core";
 
-// Capture host scheduling before an Eval realm can replace timer globals.
+// Capture host primitives before fixture overrides or evaluated code can replace them.
 const hostImmediate = setImmediate;
 const hostTimeout = setTimeout;
+const HostWorker = globalThis.Worker;
 export async function hostTurn(): Promise<void> {
 	const turn = Promise.withResolvers<void>();
 	hostImmediate(() => turn.resolve());
@@ -58,28 +58,55 @@ export async function waitPastNativeCloseGrace(): Promise<void> {
 
 export type RunOutcome = { ok: true; stdout: string } | { ok: false; error: Error; stdout: string };
 
-/** Real Eval worker core, but no subprocess, thread, process.exit, or PID callback. */
+/** Real isolated Eval entrypoint; the native tab VM remains in a separate host realm. */
 function evalWorker(): JsEvalWorkerHandle {
-	const listeners = new Set<(message: EvalOutbound) => void>();
-	let receive: ((message: EvalInbound) => void) | undefined;
+	const hostEntry = workerHostEntry();
+	const worker = hostEntry
+		? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_js_eval"] })
+		: new Worker(new URL("../../src/eval/js/worker-entry.ts", import.meta.url).href, { type: "module" });
 	const closed = Promise.withResolvers<void>();
-	const core = new EvalWorkerCore({
-		send(message) {
-			queueMicrotask(() => {
-				if (message.type === "closed") closed.resolve();
-				for (const listener of listeners) listener(message);
-			});
-		},
-		onMessage(handler) { receive = handler; return () => { receive = undefined; }; },
-		close() {},
-	}, { mode: "inline", interceptUnhandledRejections: postmortem.interceptUnhandledRejections });
+	let acknowledged = false;
+	let exited = false;
+	const finish = (): void => { if (acknowledged && exited) closed.resolve(); };
+	worker.addEventListener("message", (event: MessageEvent<EvalOutbound>) => {
+		if (event.data.type !== "closed") return;
+		acknowledged = true;
+		finish();
+	});
+	worker.addEventListener("close", () => { exited = true; finish(); });
 	return {
 		mode: "worker",
-		send(message) { queueMicrotask(() => receive?.(message)); },
-		onMessage(handler) { listeners.add(handler); return () => listeners.delete(handler); },
-		onError() { return () => {}; },
-		async close() { receive?.({ type: "close" }); await closed.promise; return true; },
-		async terminate() { core.dispose(); listeners.clear(); },
+		send(message) { worker.postMessage(message); },
+		onMessage(handler) {
+			const listener = (event: MessageEvent<EvalOutbound>): void => handler(event.data);
+			worker.addEventListener("message", listener);
+			return () => worker.removeEventListener("message", listener);
+		},
+		onError(handler) {
+			const error = (event: ErrorEvent): void => handler(event.error instanceof Error ? event.error : new Error(event.message));
+			const messageError = (event: MessageEvent): void => handler(new Error(`Owned Eval worker message error: ${String(event.data)}`));
+			const exit = (): void => handler(new Error("Owned Eval worker exited"));
+			worker.addEventListener("error", error);
+			worker.addEventListener("messageerror", messageError);
+			worker.addEventListener("close", exit);
+			return () => {
+				worker.removeEventListener("error", error);
+				worker.removeEventListener("messageerror", messageError);
+				worker.removeEventListener("close", exit);
+			};
+		},
+		async close() {
+			const deadline = AbortSignal.timeout(1_000);
+			worker.postMessage({ type: "close" } satisfies EvalInbound);
+			try {
+				await untilAborted(deadline, closed.promise);
+				return true;
+			} catch (error) {
+				if (!deadline.aborted) throw error;
+				return false;
+			}
+		},
+		async terminate() { worker.terminate(); },
 	};
 }
 
@@ -273,11 +300,11 @@ export class OwnedBrowserLifetime {
 	#downloadDetach?: OwnedDetachGate;
 	#isolatedEvalWorkers?: Set<Worker>;
 
-	static async create(options: { isolatedEval?: boolean } = {}): Promise<OwnedBrowserLifetime> {
+	static async create(): Promise<OwnedBrowserLifetime> {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-owned-lifetime-fixture-"));
 		const fixture = new OwnedBrowserLifetime(root);
 		try {
-			fixture.install(options);
+			fixture.install();
 			return fixture;
 		} catch (error) {
 			await fixture.dispose();
@@ -326,12 +353,10 @@ export class OwnedBrowserLifetime {
 		});
 	}
 
-	install(options: { isolatedEval?: boolean } = {}): void {
-		// Queue cases retain production Eval factories. The subprocess guard below
-		// selects their real Bun Worker fallback, not another same-realm core.
-		if (!options.isolatedEval) {
-			this.#restores.push(setJsEvalWorkerFactoriesForTests({ spawnProcess: evalWorker, spawnWorker: evalWorker }));
-		}
+	install(): void {
+		// Never inherit a previous fixture's same-realm factory. Every outer Eval
+		// has its own Worker, leaving nested native-tab execution a third realm.
+		this.#restores.push(setJsEvalWorkerFactoriesForTests({ spawnProcess: evalWorker, spawnWorker: evalWorker }));
 		const spawn = spyOn(Bun, "spawn").mockImplementation((() => {
 			throw new Error("Owned native fixture refuses OS process creation");
 		}) as typeof Bun.spawn);
@@ -369,12 +394,9 @@ export class OwnedBrowserLifetime {
 		});
 		this.#restores.push(() => stealth.mockRestore());
 		const fixture = this;
-		const RealWorker = globalThis.Worker;
 		const worker = spyOn(globalThis, "Worker").mockImplementation(function ownedWorker(entry: string, workerOptions?: ConstructorParameters<typeof Worker>[1]) {
-			if (options.isolatedEval && (String(entry).endsWith("/eval/js/worker-entry.ts") || workerOptions?.argv?.includes("__omp_worker_js_eval"))) {
-				// Keep production Eval startup/transport/exit semantics. Only native-tab
-				// endpoints below are in-process; overlapping Eval runs need distinct realms.
-				const isolated = new RealWorker(entry, workerOptions);
+			if (String(entry).endsWith("/eval/js/worker-entry.ts") || workerOptions?.argv?.includes("__omp_worker_js_eval")) {
+				const isolated = new HostWorker(entry, workerOptions);
 				(fixture.#isolatedEvalWorkers ??= new Set()).add(isolated);
 				isolated.addEventListener("close", () => fixture.#isolatedEvalWorkers?.delete(isolated), { once: true });
 				return isolated;
