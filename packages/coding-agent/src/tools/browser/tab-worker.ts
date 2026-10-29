@@ -3554,6 +3554,11 @@ export class WorkerCore {
 		if (!uncertain) {
 			await this.#closeResource("worker", () => this.#browser?.connected ? this.#browser.disconnect() : undefined, signal, issues);
 		}
+		// Retrying a resource can return early after it cleared its own handle.
+		// Earlier passes still own their pending tasks until those tasks settle.
+		if ((this.#pendingCleanup?.size ?? 0) > 0) {
+			issues.push({ resource: "worker", state: "unconfirmed", targetId: this.#targetId });
+		}
 		const cleanup: BrowserCleanupReport = {
 			version: BROWSER_EVAL_LIFETIME_VERSION,
 			targetId: this.#targetId,

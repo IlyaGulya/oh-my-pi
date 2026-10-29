@@ -271,12 +271,13 @@ export class OwnedBrowserLifetime {
 	#pagePeers = new Map<string, OwnedPagePeer>();
 	#acquisitionObservers = new Map<string, () => void>();
 	#downloadDetach?: OwnedDetachGate;
+	#isolatedEvalWorkers?: Set<Worker>;
 
-	static async create(): Promise<OwnedBrowserLifetime> {
+	static async create(options: { isolatedEval?: boolean } = {}): Promise<OwnedBrowserLifetime> {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-owned-lifetime-fixture-"));
 		const fixture = new OwnedBrowserLifetime(root);
 		try {
-			fixture.install();
+			fixture.install(options);
 			return fixture;
 		} catch (error) {
 			await fixture.dispose();
@@ -325,8 +326,12 @@ export class OwnedBrowserLifetime {
 		});
 	}
 
-	install(): void {
-		this.#restores.push(setJsEvalWorkerFactoriesForTests({ spawnProcess: evalWorker, spawnWorker: evalWorker }));
+	install(options: { isolatedEval?: boolean } = {}): void {
+		// Queue cases retain production Eval factories. The subprocess guard below
+		// selects their real Bun Worker fallback, not another same-realm core.
+		if (!options.isolatedEval) {
+			this.#restores.push(setJsEvalWorkerFactoriesForTests({ spawnProcess: evalWorker, spawnWorker: evalWorker }));
+		}
 		const spawn = spyOn(Bun, "spawn").mockImplementation((() => {
 			throw new Error("Owned native fixture refuses OS process creation");
 		}) as typeof Bun.spawn);
@@ -346,7 +351,7 @@ export class OwnedBrowserLifetime {
 		this.#restores.push(() => acquireBrowser.mockRestore());
 		const chromium = spyOn(launch, "ensureChromiumExecutable").mockResolvedValue("/not-executed/owned-chromium");
 		this.#restores.push(() => chromium.mockRestore());
-		const load = spyOn(launch, "loadPuppeteerInWorker").mockResolvedValue(puppeteer);
+		const load = spyOn(launch, "loadPuppeteerInWorker").mockResolvedValue(puppeteer.default);
 		this.#restores.push(() => load.mockRestore());
 		const devices = spyOn(launch, "loadedKnownDevices").mockReturnValue(puppeteer.KnownDevices);
 		this.#restores.push(() => devices.mockRestore());
@@ -364,8 +369,17 @@ export class OwnedBrowserLifetime {
 		});
 		this.#restores.push(() => stealth.mockRestore());
 		const fixture = this;
-		const worker = spyOn(globalThis, "Worker").mockImplementation(function ownedWorker(entry: string, options?: { argv?: string[] }) {
-			if (!String(entry).endsWith("/tab-worker-entry.ts") && !options?.argv?.includes("__omp_worker_tab")) {
+		const RealWorker = globalThis.Worker;
+		const worker = spyOn(globalThis, "Worker").mockImplementation(function ownedWorker(entry: string, workerOptions?: ConstructorParameters<typeof Worker>[1]) {
+			if (options.isolatedEval && (String(entry).endsWith("/eval/js/worker-entry.ts") || workerOptions?.argv?.includes("__omp_worker_js_eval"))) {
+				// Keep production Eval startup/transport/exit semantics. Only native-tab
+				// endpoints below are in-process; overlapping Eval runs need distinct realms.
+				const isolated = new RealWorker(entry, workerOptions);
+				(fixture.#isolatedEvalWorkers ??= new Set()).add(isolated);
+				isolated.addEventListener("close", () => fixture.#isolatedEvalWorkers?.delete(isolated), { once: true });
+				return isolated;
+			}
+			if (!String(entry).endsWith("/tab-worker-entry.ts") && !workerOptions?.argv?.includes("__omp_worker_tab")) {
 				throw new Error("Non-owned Worker construction refused");
 			}
 			const endpoint = new OwnedTabWorker();
@@ -685,6 +699,7 @@ export class OwnedBrowserLifetime {
 			await fs.rm(daemonRuntimeDir(this.root), { recursive: true, force: true });
 			await fs.rm(this.root, { recursive: true, force: true });
 		} finally {
+			for (const worker of this.#isolatedEvalWorkers ?? []) worker.terminate();
 			for (const restore of this.#restores.reverse()) restore();
 		}
 	}

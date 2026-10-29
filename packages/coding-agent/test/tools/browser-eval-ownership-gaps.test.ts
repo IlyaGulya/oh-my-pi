@@ -26,7 +26,7 @@ function reach<T>(phase: Promise<T>, operation: Promise<{ ok: boolean; error?: u
 }
 
 let owned: OwnedBrowserLifetime;
-beforeEach(async () => { owned = await OwnedBrowserLifetime.create(); });
+beforeEach(async () => { owned = await OwnedBrowserLifetime.create({ isolatedEval: true }); });
 afterEach(async () => { await owned.dispose(); });
 
 describe("late initialization preserves actual page ownership", () => {

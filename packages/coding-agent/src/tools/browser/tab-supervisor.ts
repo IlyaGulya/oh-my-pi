@@ -276,12 +276,15 @@ interface NativeClose {
 	promise: Promise<BrowserCleanupReport>;
 	report?: BrowserCleanupReport;
 }
+/** Ownership comes from the published tab or the concrete acquisition payload, never an acknowledgement id. */
+type NativeWorkerOwner = WorkerTabSession | WorkerInitPayload;
+
 interface RetainedCleanup {
 	id: string;
 	browser: PuppeteerBrowserHandle;
 	worker: WorkerHandle;
 	targetId?: string;
-	tab?: WorkerTabSession;
+	owner: NativeWorkerOwner;
 	preservePage: boolean;
 }
 const nativeCloses = new WeakMap<WorkerHandle, NativeClose>();
@@ -330,14 +333,14 @@ function requestNativeClose(worker: WorkerHandle, browser: PuppeteerBrowserHandl
 	return close;
 }
 
-function closeNativeWorker(browser: PuppeteerBrowserHandle, worker: WorkerHandle, timeoutMs: number, tab?: WorkerTabSession, preservePage = false): Promise<void> {
+function closeNativeWorker(browser: PuppeteerBrowserHandle, worker: WorkerHandle, timeoutMs: number, owner: NativeWorkerOwner, preservePage = false): Promise<void> {
 	const ongoing = nativeCleanupInflight.get(worker);
 	if (ongoing) {
 		if (preservePage || !ongoing.preservePage) return ongoing.promise;
-		const close = () => closeNativeWorker(browser, worker, timeoutMs, tab, false);
+		const close = () => closeNativeWorker(browser, worker, timeoutMs, owner, false);
 		return ongoing.promise.then(close, close);
 	}
-	const promise = closeNativeWorkerImpl(browser, worker, timeoutMs, tab, preservePage);
+	const promise = closeNativeWorkerImpl(browser, worker, timeoutMs, owner, preservePage);
 	const entry = { promise, preservePage };
 	nativeCleanupInflight.set(worker, entry);
 	void promise.finally(() => {
@@ -350,7 +353,7 @@ async function closeNativeWorkerImpl(
 	browser: PuppeteerBrowserHandle,
 	worker: WorkerHandle,
 	timeoutMs: number,
-	tab?: WorkerTabSession,
+	owner: NativeWorkerOwner,
 	preservePage = false,
 ): Promise<void> {
 	preservePage &&= retainedCleanups?.get(worker)?.preservePage ?? true;
@@ -360,8 +363,10 @@ async function closeNativeWorkerImpl(
 	} catch {
 		// A timeout never authorizes terminating a worker with an unconfirmed encoder.
 	}
-	const owns = tab?.ownsPage ?? true;
-	const targetId = owns ? (tab?.targetId ?? workerPageTargets.get(worker) ?? close.report?.targetId) : undefined;
+	const tab = "backend" in owner ? owner : undefined;
+	const owns = "backend" in owner ? owner.ownsPage : ownsPage(owner);
+	const knownTarget = "backend" in owner ? owner.targetId : owner.mode === "attach" && owner.page.kind !== "create" ? owner.page.targetId : undefined;
+	const targetId = owns ? (knownTarget ?? workerPageTargets.get(worker) ?? close.report?.targetId) : undefined;
 	const scope = sharedScopeOf(browser);
 	let targetClosed = preservePage || !owns;
 	if (targetId && !preservePage) {
@@ -390,7 +395,7 @@ async function closeNativeWorkerImpl(
 	if (!workerStopped || !targetClosed) {
 		if (!retained) {
 			holdBrowser(browser);
-			retained = { id: crypto.randomUUID(), browser, worker, targetId, tab, preservePage };
+			retained = { id: crypto.randomUUID(), browser, worker, targetId, owner, preservePage };
 			(retainedCleanups ??= new Map()).set(worker, retained);
 		}
 		retained.preservePage &&= preservePage;
@@ -418,7 +423,7 @@ async function closeNativeWorkerImpl(
 /** Retry only one retained native identity; never resolve a reusable tab name. */
 export async function retryBrowserCleanup(workerId: string): Promise<void> {
 	const retained = retainedCleanups && Array.from(retainedCleanups.values()).find(entry => entry.id === workerId);
-	if (retained) await closeNativeWorker(retained.browser, retained.worker, DEFAULT_TAB_CLOSE_TIMEOUT_MS, retained.tab, retained.preservePage);
+	if (retained) await closeNativeWorker(retained.browser, retained.worker, DEFAULT_TAB_CLOSE_TIMEOUT_MS, retained.owner, retained.preservePage);
 }
 // What every worker replacement resets, for results that report one.
 const WORKER_RESETS =
@@ -754,7 +759,7 @@ async function acquireTabImpl(
 		// `BuildMessage`-class failures arrive asynchronously via the worker's `error` event,
 		// after `spawnTabWorker`'s synchronous try/catch has already returned. Fall back to
 		// the inline worker here so module-resolution failures don't poison every tab open.
-		await closeAbandonedWorkerPage(browser, worker);
+		await closeAbandonedWorkerPage(browser, worker, initPayload);
 		if (worker.mode === "inline" || isReportedInitFailure(error)) {
 			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
 			throw error;
@@ -773,7 +778,7 @@ async function acquireTabImpl(
 		try {
 			info = await untilAborted(opts.signal, initializeTabWorker(worker, initPayload, initBudgetMs, startedAt, opts.signal));
 		} catch (inlineError) {
-			await closeAbandonedWorkerPage(browser, worker);
+			await closeAbandonedWorkerPage(browser, worker, initPayload);
 			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
 			const finalError = new ToolError(
 				`Failed to start browser tab worker (inline fallback also failed): ${inlineError instanceof Error ? inlineError.message : String(inlineError)}`,
@@ -791,7 +796,7 @@ async function acquireTabImpl(
 	// the registry; a browser still leased/held elsewhere (refCount > 0) is left
 	// for its owner to release.
 	if (opts.signal?.aborted || (opts.requireNewOwnedPage && info.cleanupVersion !== BROWSER_EVAL_LIFETIME_VERSION)) {
-		await closeAbandonedWorkerPage(browser, worker);
+		await closeAbandonedWorkerPage(browser, worker, initPayload);
 		if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false }).catch(() => undefined);
 		if (opts.signal?.aborted) throw new ToolAbortError("Browser tab open aborted");
 		throw new ToolError("Native browser worker does not support confirmed Eval lifetime cleanup");
@@ -2362,8 +2367,8 @@ function recheckSharedBrowser(scope: SharedTargetScope): void {
 
 
 /** Await the same trusted native close for a page created during a failed init. */
-async function closeAbandonedWorkerPage(browser: PuppeteerBrowserHandle, worker: WorkerHandle): Promise<void> {
-	await closeNativeWorker(browser, worker, DEFAULT_TAB_CLOSE_TIMEOUT_MS);
+async function closeAbandonedWorkerPage(browser: PuppeteerBrowserHandle, worker: WorkerHandle, payload: WorkerInitPayload): Promise<void> {
+	await closeNativeWorker(browser, worker, DEFAULT_TAB_CLOSE_TIMEOUT_MS, payload);
 }
 
 async function waitForClosed(tab: WorkerTabSession): Promise<void> {
