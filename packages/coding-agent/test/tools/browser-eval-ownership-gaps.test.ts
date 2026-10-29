@@ -194,7 +194,7 @@ describe("serialized ordinary opens respect Eval ownership", () => {
 				expect(persisted).toBe(false);
 				expect(target.present).toBe(false);
 			} else {
-				expect(secondResult.ok).toBe(true);
+				expect(secondResult.ok, secondResult.ok ? undefined : secondResult.error.stack ?? secondResult.error.message).toBe(true);
 				expect(urlAfter).toBe(destination);
 				expect(persisted).toBe(true);
 				expect(target.present).toBe(true);
