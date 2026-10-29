@@ -1,7 +1,7 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { isRecord, logger, untilAborted } from "@oh-my-pi/pi-utils";
-import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
+import { EvalCleanupError, type EvalPreludeContext, type EvalPreludeDefinition } from "../eval/preludes";
 import type { ToolSession } from "../sdk";
 import { enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { resolveCmuxKind } from "./browser/cmux/rpc";
@@ -15,6 +15,12 @@ import {
 	releaseBrowser,
 } from "./browser/registry";
 import { ensureChromiumExecutable } from "./browser/launch";
+import {
+	BROWSER_EVAL_LIFETIME_VERSION,
+	BrowserCleanupError,
+	type BrowserCapabilities,
+	type BrowserEvalOwnership,
+} from "./browser/lifetime";
 import { resolveInitScriptSources } from "./browser/open-options";
 import { resolveRelayKind } from "./browser/relay/kind";
 import { describeTernTargets, listTernBlocks, type TernTarget, ternTargets } from "./browser/tern/blocks";
@@ -29,6 +35,8 @@ import {
 	cancelIdleCloseForOwner,
 	dropHeadlessTabs,
 	getTab,
+	getEvalOwnedTab,
+	claimEvalTab,
 	listTabs,
 	releaseAllTabs,
 	releaseIdleTabsForOwner,
@@ -36,6 +44,7 @@ import {
 	runInTab,
 	type TabSession,
 	type TernTabSession,
+	type WorkerTabSession,
 	ternBlocksTaken,
 } from "./browser/tab-supervisor";
 import { renderTabCall } from "./browser/tab-call";
@@ -58,6 +67,7 @@ import {
 import { cfgToolsMaxTimeout } from "./settings";
 
 export type { AriaSnapshotOptions } from "./browser/aria/aria-snapshot";
+export * from "./browser/lifetime";
 
 /** First-use boundary for the generated Playwright ARIA evaluator bundle. */
 export function buildAriaSnapshotScript(selector: string | undefined, options: AriaSnapshotOptions = {}): string {
@@ -114,7 +124,7 @@ const tabCallStepSchema = type({
 });
 
 const browserSchema = type({
-	action: type("'open' | 'close' | 'run' | 'call' | 'tabs' | 'targets'").describe("operation"),
+	action: type("'open' | 'close' | 'run' | 'call' | 'tabs' | 'targets' | 'capabilities'").describe("operation"),
 	"name?": type("string").describe("tab id (default 'main')"),
 	"url?": type("string").describe("url to open"),
 	"app?": appSchema,
@@ -143,9 +153,21 @@ const browserSchema = type({
 	"kill?": type("boolean").describe("also kill spawned-app browsers"),
 	"persist?": type("boolean").describe("keep tab live across turn settle and idle close"),
 	"lifetime?": type("'session' | 'eval'").describe("session by default; eval closes a new owned page when its JavaScript Eval ends"),
+	"lease?": type("string").describe("exact Eval-owned handle identity; supplied by the browser facade"),
 });
 
 type BrowserParams = typeof browserSchema.infer;
+
+/** Typed options accepted by the public browser.open facade. */
+export type BrowserOpenOptions = Omit<BrowserParams, "action" | "code" | "fn" | "args" | "chain" | "all" | "kill" | "lease">;
+
+interface EvalOwnedOpen {
+	ownerGeneration: string;
+	started: boolean;
+	finished: PromiseWithResolvers<void>;
+	tab?: WorkerTabSession;
+	failure?: BrowserCleanupError;
+}
 
 interface BrowserPreludeDetails {
 	meta?: OutputMeta;
@@ -156,6 +178,8 @@ interface BrowserPreludeDetails {
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	screenshots?: ScreenshotResult[];
 	value?: unknown;
+	capabilities?: BrowserCapabilities;
+	ownership?: BrowserEvalOwnership;
 }
 
 /**
@@ -332,10 +356,33 @@ async function invokeBrowser(
 		const timeoutMs = timeoutSeconds * 1000;
 		const name = parsed.name ?? DEFAULT_TAB_NAME;
 		const details: BrowserPreludeDetails = { action: parsed.action, name };
+		if (parsed.lease && parsed.all) throw new ToolError("An owned handle cannot request a bulk close");
+		if (parsed.action === "run" || parsed.action === "call" || (parsed.action === "close" && !parsed.all)) {
+			const tab = parsed.lease ? getEvalOwnedTab(parsed.lease) : getTab(name);
+			if (parsed.lease && !tab && parsed.action !== "close") throw new ToolError("Eval-owned browser handle has expired");
+			if (tab?.backend === "worker" && tab.evalOwnership && parsed.action !== "close" &&
+				tab.evalOwnership.ownerGeneration !== context.evalOwner) {
+				throw new ToolError("Eval-owned browser handle belongs to another or completed Eval");
+			}
+			if (parsed.lease && tab && tab.name !== name) throw new ToolError("Eval-owned browser handle does not match this tab");
+			if (parsed.lease && parsed.action !== "close" && getTab(name) !== tab) {
+				throw new ToolError("Eval-owned browser handle no longer identifies the active tab");
+			}
+		}
 
 		switch (parsed.action) {
+			case "capabilities":
+				details.capabilities = {
+					version: BROWSER_EVAL_LIFETIME_VERSION,
+					evalLifetime: {
+						supported: context.registerCleanup !== undefined,
+						backends: ["headless", "relay"],
+						receiptVersion: BROWSER_EVAL_LIFETIME_VERSION,
+					},
+				};
+				return toolResult(details).done();
 			case "open":
-				return await openBrowser(session, name, parsed, details, timeoutMs, context.signal, context.registerCleanup);
+				return await openBrowser(session, name, parsed, details, timeoutMs, context);
 			case "close":
 				return await closeBrowser(name, parsed, details, timeoutMs, context.signal);
 			case "tabs":
@@ -369,11 +416,11 @@ async function openBrowser(
 	params: BrowserParams,
 	details: BrowserPreludeDetails,
 	timeoutMs: number,
-	signal?: AbortSignal,
-	registerCleanup?: EvalPreludeContext["registerCleanup"],
+	context: EvalPreludeContext,
 ): Promise<AgentToolResult<unknown>> {
+	const signal = context.signal;
 	if (params.lifetime === "eval") {
-		if (!registerCleanup) throw new ToolError("Eval browser lifetime requires a supported JavaScript Eval run");
+		if (!context.registerCleanup) throw new ToolError("Eval browser lifetime requires a supported JavaScript Eval run");
 		if (params.persist) throw new ToolError("Eval browser lifetime cannot be combined with persist: true");
 		if (params.app?.target !== undefined) throw new ToolError("Eval browser lifetime cannot adopt a user page");
 		if (getTab(name)) throw new ToolError("Eval lifetime requires a new, uniquely named tab");
@@ -384,11 +431,45 @@ async function openBrowser(
 	}
 	const autoTern = resolved.kind === "tern" && params.app?.tern !== true && params.app?.target === undefined;
 	const existing = getTab(name);
+	if (existing?.backend === "worker" && existing.evalOwnership) {
+		if (existing.evalOwnership.ownerGeneration !== context.evalOwner) {
+			throw new ToolError("Eval-owned browser tab belongs to another or completed Eval");
+		}
+		if (params.persist) throw new ToolError("Eval-owned browser tabs cannot be made persistent");
+	}
 	const kind = autoTern && existing && existing.kindTag !== "tern" ? existing.browser.kind : resolved;
+	let owned: EvalOwnedOpen | undefined;
+	if (params.lifetime === "eval" && context.registerCleanup) {
+		const entry: EvalOwnedOpen = {
+			ownerGeneration: "",
+			started: false,
+			finished: Promise.withResolvers<void>(),
+		};
+		entry.ownerGeneration = await context.registerCleanup(async () => {
+			if (entry.started) await entry.finished.promise;
+			const errors: unknown[] = [];
+			if (entry.failure) errors.push(entry.failure);
+			if (entry.tab) {
+				try {
+					await releaseTab(name, { expectedTab: entry.tab });
+				} catch (error) {
+					if (error !== entry.failure) errors.push(error);
+				}
+			}
+			if (errors.length > 0) throw new EvalCleanupError(errors);
+		});
+		if (typeof entry.ownerGeneration !== "string" || !entry.ownerGeneration) {
+			throw new ToolError("Eval host did not register a native resource owner generation");
+		}
+		throwIfAborted(signal);
+		entry.started = true;
+		owned = entry;
+	}
 	const startedAt = performance.now();
 	try {
-		return await openOnKind(session, name, params, details, kind, timeoutMs, [], signal, registerCleanup);
+		return await openOnKind(session, name, params, details, kind, timeoutMs, [], signal, owned);
 	} catch (error) {
+		if (owned && error instanceof BrowserCleanupError) owned.failure = error;
 		if (kind.kind !== "tern" || !autoTern || !isTernUnavailable(error) || signal?.aborted) throw error;
 		// A Tern tab under this name whose window went away still holds the name: release
 		// that one (and only that one) so the Chromium tab can take it.
@@ -405,8 +486,10 @@ async function openBrowser(
 			remainingMs,
 			[note],
 			signal,
-			registerCleanup,
+			owned,
 		);
+	} finally {
+		owned?.finished.resolve();
 	}
 }
 
@@ -419,7 +502,7 @@ async function openOnKind(
 	timeoutMs: number,
 	notes: readonly string[],
 	signal?: AbortSignal,
-	registerCleanup?: EvalPreludeContext["registerCleanup"],
+	owned?: EvalOwnedOpen,
 ): Promise<AgentToolResult<unknown>> {
 	const downloadsPath = params.downloads === undefined ? undefined : resolveToCwd(params.downloads, session.cwd);
 	details.browser = kind.kind;
@@ -454,7 +537,7 @@ async function openOnKind(
 	// The step in flight when the deadline fires; a timeout names it.
 	let stage = `launching or connecting to the browser (${describeKind(kind)})`;
 	try {
-		const browser = await untilAborted(openSignal, () =>
+		const connect = () =>
 			acquireBrowser(kind, {
 				cwd: session.cwd,
 				viewport: params.viewport
@@ -465,8 +548,8 @@ async function openOnKind(
 						}
 					: undefined,
 				signal: openSignal,
-			}),
-		);
+			});
+		const browser = owned ? await connect() : await untilAborted(openSignal, connect);
 
 		// Hold one open-acquisition lease across the whole tab acquisition.
 		// A freshly-created browser sits in the registry at refCount 0 until a
@@ -496,7 +579,7 @@ async function openOnKind(
 				await untilAborted(openSignal, () => releaseTab(name, { kill: false, timeoutMs }));
 				stage = `opening tab ${JSON.stringify(name)}`;
 			}
-			result = await untilAborted(openSignal, () =>
+			const acquire = () =>
 				acquireTab(name, browser, {
 					url: params.url,
 					waitUntil: params.wait_until,
@@ -522,14 +605,15 @@ async function openOnKind(
 					// while reuse by the owner leaves a set value alone.
 					persist: params.persist,
 					requireNewOwnedPage: params.lifetime === "eval",
-					onCreated: params.lifetime === "eval" && registerCleanup
-						? tab => registerCleanup(async () => {
-							// Independent of both the revoked bridge and its aborted call signal.
-							await releaseTab(name, { expectedTab: tab });
-						})
+					onCreated: owned
+						? async tab => {
+							owned.tab = tab;
+							details.ownership = claimEvalTab(tab, owned.ownerGeneration);
+						}
 						: undefined,
-				}),
-			);
+				});
+			// An Eval-owned open must join the actual acquisition, not an abort wrapper.
+			result = owned ? await acquire() : await untilAborted(openSignal, acquire);
 		} catch (error) {
 			await releaseBrowser(browser, {
 				kill: "subprocess" in browser && browser.subprocess !== undefined,
@@ -550,6 +634,7 @@ async function openOnKind(
 		const title = tab.info.title ?? "";
 		details.url = url;
 		details.viewport = tab.info.viewport;
+		if (owned) throwIfAborted(openSignal);
 		const verb = result.created ? "Opened" : "Reused";
 		const lines = [
 			`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(tab)}`,
@@ -564,6 +649,7 @@ async function openOnKind(
 		// Caller cancellation stays a ToolAbortError; the requested timeout
 		// becomes a timeout ToolError naming the stalled step; anything else
 		// passes through unchanged.
+		if (error instanceof BrowserCleanupError) throw error;
 		if (signal?.aborted) throw error instanceof ToolAbortError ? error : new ToolAbortError();
 		if (timeoutSignal.aborted) throw new ToolError(`Browser open timed out after ${timeoutMs}ms while ${stage}`);
 		throw error;
@@ -637,7 +723,8 @@ async function closeBrowser(
 		const text = `Released ${count} managed tab${count === 1 ? "" : "s"}`;
 		return toolResult(details).text(text).done();
 	}
-	const closed = await untilAborted(signal, () => releaseTab(name, { kill, timeoutMs }));
+	const expectedTab = params.lease ? getEvalOwnedTab(params.lease) : undefined;
+	const closed = params.lease && !expectedTab ? false : await untilAborted(signal, () => releaseTab(name, { kill, timeoutMs, expectedTab }));
 	const text = closed ? `Released managed tab ${JSON.stringify(name)}` : `No tab named ${JSON.stringify(name)}`;
 	return toolResult(details).text(text).done();
 }

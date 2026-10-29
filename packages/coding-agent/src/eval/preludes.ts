@@ -19,8 +19,10 @@ export interface EvalPreludeContext {
 	toolCallId: string;
 	/** Cancellation signal for this host invocation, not a resource lifetime. */
 	signal?: AbortSignal;
-	/** Present only on Eval surfaces that await cleanup at every run termination boundary. */
-	registerCleanup?: (cleanup: () => Promise<void>) => Promise<void>;
+	/** Register before acquisition. Resolves to the owning Eval's opaque drain generation. */
+	registerCleanup?: (cleanup: () => Promise<void>) => Promise<string>;
+	/** Set after this Eval first registers ownership; absent on unsupported surfaces. */
+	evalOwner?: string;
 	/** Ordinary agent tool context used for settings, UI, and provider metadata. */
 	context?: AgentToolContext;
 	/** Progress receiver shared with the active eval call. */

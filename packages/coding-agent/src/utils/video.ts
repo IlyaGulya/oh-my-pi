@@ -11,6 +11,7 @@ import * as path from "node:path";
 import { rasterizeSvg } from "@oh-my-pi/pi-natives";
 import { isVideoPath } from "@oh-my-pi/pi-tui/prompt/video";
 import { untilAborted } from "@oh-my-pi/pi-utils/abortable";
+import { withTimeout } from "@oh-my-pi/pi-utils";
 import { TempDir } from "@oh-my-pi/pi-utils/temp";
 import { $which } from "@oh-my-pi/pi-utils/which";
 
@@ -106,6 +107,14 @@ export interface VideoMetadata {
 
 /** Raised when ffmpeg/ffprobe is missing or a video operation fails. Message is user-facing. */
 export class VideoError extends Error {}
+
+/** Retains the actual encoder handle when its exit could not be confirmed. */
+export class VideoProcessCleanupError extends VideoError {
+	constructor(readonly confirmStopped: () => Promise<void>) {
+		super("Video encoder termination could not be confirmed.");
+		this.name = "VideoProcessCleanupError";
+	}
+}
 
 let cachedFpsModeFlag: string[] | null = null;
 
@@ -315,6 +324,7 @@ export async function runFfmpeg(args: string[], signal?: AbortSignal): Promise<v
 		child.kill();
 	};
 	signal?.addEventListener("abort", killOnAbort, { once: true });
+	if (signal?.aborted) killOnAbort();
 	let stderr: string;
 	let exitCode: number;
 	try {
@@ -323,12 +333,36 @@ export async function runFfmpeg(args: string[], signal?: AbortSignal): Promise<v
 			Promise.all([readStream(child.stdout), readStream(child.stderr), child.exited]),
 		);
 	} catch (error) {
+		const confirmStopped = async (): Promise<void> => {
+			if (child.exitCode === null) child.kill("SIGKILL");
+			await withTimeout(child.exited, 1_000, "Timed out stopping video encoder");
+		};
+		try {
+			await confirmStopped();
+		} catch {
+			throw new VideoProcessCleanupError(confirmStopped);
+		}
 		if (signal?.aborted) throw new VideoError("Video operation aborted.");
 		throw error;
 	} finally {
 		signal?.removeEventListener("abort", killOnAbort);
 	}
 	if (exitCode !== 0) throw new VideoError(`ffmpeg failed (exit ${exitCode}): ${stderr.trim().slice(-300)}`);
+}
+
+/** A failed thumbnail must not return while its sibling encoders are still running. */
+function checkVideoWorkers(results: readonly PromiseSettledResult<void>[]): void {
+	const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+	if (errors.length === 0) return;
+	const pending = errors.filter((error): error is VideoProcessCleanupError => error instanceof VideoProcessCleanupError);
+	if (pending.length > 0) {
+		throw new VideoProcessCleanupError(async () => {
+			const stopped = await Promise.allSettled(pending.map(error => error.confirmStopped()));
+			const failed = stopped.find(result => result.status === "rejected");
+			if (failed?.status === "rejected") throw failed.reason;
+		});
+	}
+	throw errors[0];
 }
 
 /**
@@ -406,7 +440,7 @@ export async function buildVideoContactSheetPng(
 				? Array.from({ length: thumbs }, (_, i) => (duration * (i + 0.5)) / thumbs)
 				: Array.from({ length: thumbs }, (_, i) => i);
 		const thumbPaths = times.map((_, i) => tmp.join(`thumb-${i}.png`));
-		await Promise.all(
+		const workers = await Promise.allSettled(
 			times.map((time, i) =>
 				runFfmpeg(
 					[
@@ -425,10 +459,11 @@ export async function buildVideoContactSheetPng(
 					// Past-the-end seeks on short/odd files leave a hole; the tile
 					// pass runs over whatever thumbs materialized instead. Cancellation
 					// is not a missing frame and must still stop every worker promptly.
-					if (signal?.aborted) throw error;
+					if (signal?.aborted || error instanceof VideoProcessCleanupError) throw error;
 				}),
 			),
 		);
+		checkVideoWorkers(workers);
 		const available = thumbPaths.filter(thumb => Bun.file(thumb).size > 0);
 		if (available.length === 0) throw new VideoError("Could not extract any preview frames from this video.");
 		const sheet = tmp.join("sheet.png");
@@ -589,7 +624,7 @@ export async function buildChangedFrameContactSheetPng(
 		const rawThumbPaths = indexes.map((_, i) => tmp.join(`thumb-raw-${i}.png`));
 		const labelPaths = indexes.map((_, i) => tmp.join(`label-${i}.png`));
 		const thumbPaths = indexes.map((_, i) => tmp.join(`thumb-${i}.png`));
-		await Promise.all(
+		const workers = await Promise.allSettled(
 			indexes.map(async (index, i) => {
 				const seconds = index / options.fps;
 				const label = formatContactSheetTimestamp(seconds);
@@ -626,10 +661,11 @@ export async function buildChangedFrameContactSheetPng(
 						signal,
 					);
 				} catch (error) {
-					if (signal?.aborted) throw error;
+					if (signal?.aborted || error instanceof VideoProcessCleanupError) throw error;
 				}
 			}),
 		);
+		checkVideoWorkers(workers);
 		const available = thumbPaths.filter(thumb => Bun.file(thumb).size > 0);
 		if (available.length === 0) throw new VideoError("Could not extract contact-sheet frames from the recording.");
 		const cols = Math.min(CONTACT_SHEET_COLS, available.length);

@@ -160,6 +160,7 @@ import {
 	type RecordingStatus,
 	type RecordingStopResult,
 } from "./recording";
+import { BROWSER_EVAL_LIFETIME_VERSION, BrowserCleanupError, type BrowserCleanupIssue, type BrowserCleanupReport } from "./lifetime";
 import {
 	type AriaSnapshotBaseline,
 	type AriaSnapshotDiffResult,
@@ -1529,6 +1530,13 @@ export class WorkerCore {
 	#screenshotHistory = new Map<string, ScreenshotHistory>();
 	#webmcp?: WebMcpController;
 	readonly #recording = new RecordingController();
+	#initializing?: Promise<void>;
+	#closing?: Promise<void>;
+	#retiring = false;
+	#closed = false;
+	#retryClose = false;
+	#pendingCleanup?: Set<Promise<unknown>>;
+	#preservePage = false;
 	/**
 	 * A back/forward cache restore brings a document back without loading it, so the frame keeps the
 	 * loader id of the document it replaced and the ids observed there would still pass as current.
@@ -1656,10 +1664,23 @@ export class WorkerCore {
 
 	async #handleMessage(msg: WorkerInbound): Promise<void> {
 		switch (msg.type) {
-			case "init":
-				await this.#init(msg.payload);
+			case "init": {
+				if (this.#retiring) return;
+				const initializing = this.#init(msg.payload);
+				this.#initializing = initializing;
+				try {
+					await initializing;
+				} finally {
+					if (this.#initializing === initializing) this.#initializing = undefined;
+					if (this.#retiring) this.#scheduleClose();
+				}
 				return;
+			}
 			case "run":
+				if (this.#retiring) {
+					this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(new ToolAbortError()) });
+					return;
+				}
 				await this.#run(msg);
 				return;
 			case "abort":
@@ -1674,7 +1695,7 @@ export class WorkerCore {
 				this.#deliverToolReply(msg.id, msg.reply);
 				return;
 			case "close":
-				await this.#close();
+				await this.#close(msg.timeoutMs, msg.preservePage ?? false);
 				return;
 		}
 	}
@@ -1691,6 +1712,7 @@ export class WorkerCore {
 				defaultViewport: null,
 				protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 			});
+			if (this.#retiring) throw new ToolAbortError();
 
 			// Realm setup is done: puppeteer loaded and browser connected. Sent before
 			// page acquisition so the supervisor's cold-start budget bounds only the
@@ -1705,8 +1727,10 @@ export class WorkerCore {
 						? { nearTargetId: payload.page.nearTargetId }
 						: undefined;
 				this.#page = await createTrackedPage(this.#browser, relay, targetId => {
+					this.#targetId = targetId;
 					this.#transport.send({ type: "page-created", targetId });
 				});
+				if (this.#retiring) throw new ToolAbortError();
 				this.#observeDialogs();
 				if (payload.mode === "headless") {
 					await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
@@ -1723,6 +1747,7 @@ export class WorkerCore {
 				if (!page)
 					throw new ToolError(`Target ${payload.page.targetId} is no longer available on the attached browser`);
 				this.#page = page;
+				if (this.#retiring) throw new ToolAbortError();
 				await this.#claimRelayTarget(page);
 				this.#observeDialogs();
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
@@ -1759,6 +1784,7 @@ export class WorkerCore {
 			this.#network = new BrowserNetworkManager(this.#page, payload.allowedDomains);
 			await this.#network.start();
 			const info = await this.#currentReadyInfo();
+			if (this.#retiring) throw new ToolAbortError();
 			this.#started = true;
 			this.#transport.send({ type: "ready", info });
 		} catch (error) {
@@ -1878,6 +1904,7 @@ export class WorkerCore {
 				? (page.viewport() ?? this.#lastViewport ?? DEFAULT_VIEWPORT)
 				: await this.#viewport().catch(() => this.#lastViewport ?? DEFAULT_VIEWPORT),
 			targetId,
+			cleanupVersion: BROWSER_EVAL_LIFETIME_VERSION,
 		};
 	}
 
@@ -3451,27 +3478,86 @@ export class WorkerCore {
 		}
 	}
 
-	async #close(): Promise<void> {
+	#scheduleClose(): void {
+		this.#retryClose = true;
+		if (!this.#closing && !this.#closed) {
+			this.#retryClose = false;
+			void this.#close().catch(() => this.#log("error", "Native browser cleanup failed"));
+		}
+	}
+
+	#close(timeoutMs = 5_000, preservePage = this.#preservePage): Promise<void> {
+		this.#preservePage = this.#retiring ? this.#preservePage && preservePage : preservePage;
+		if (this.#closing) return this.#closing;
+		if (this.#closed) return Promise.resolve();
+		this.#retiring = true;
+		this.#active?.ac.abort(postmortem.markExpectedCleanupError(new ToolAbortError()));
+		const closing = this.#closeResources(timeoutMs);
+		this.#closing = closing;
+		void closing.finally(() => {
+			if (this.#closing === closing) this.#closing = undefined;
+			if (this.#retryClose && !this.#closed) this.#scheduleClose();
+		}).catch(() => this.#log("error", "Native browser cleanup failed"));
+		return closing;
+	}
+
+	async #closeResource(
+		resource: BrowserCleanupIssue["resource"],
+		operation: () => unknown,
+		signal: AbortSignal,
+		issues: BrowserCleanupIssue[],
+	): Promise<void> {
+		let settled = false;
+		const task = Promise.resolve().then(operation);
+		void task.then(() => { settled = true; }, () => { settled = true; });
+		try {
+			await untilAborted(signal, task);
+		} catch (error) {
+			const uncertain = !settled || (error instanceof BrowserCleanupError && error.uncertain) ||
+				(resource === "recording" && this.#recording.status().active);
+			issues.push({ resource, state: uncertain ? "unconfirmed" : "failed", targetId: this.#targetId });
+			if (!settled) {
+				(this.#pendingCleanup ??= new Set()).add(task);
+				const finished = () => {
+					this.#pendingCleanup?.delete(task);
+					if (this.#pendingCleanup?.size === 0) this.#scheduleClose();
+				};
+				void task.then(finished, finished);
+			}
+		}
+	}
+
+	async #closeResources(timeoutMs: number): Promise<void> {
+		const signal = AbortSignal.timeout(Math.max(1, timeoutMs));
+		const issues: BrowserCleanupIssue[] = [];
+		if (this.#initializing) await this.#closeResource("worker", () => this.#initializing, signal, issues);
+		this.#clearElementCache();
+		await this.#closeResource("recording", () => this.#recording.close({ signal }), signal, issues);
+		await this.#closeResource("worker", () => this.#webmcp?.dispose(), signal, issues);
+		await this.#closeResource("worker", () => this.#dialogs?.dispose(), signal, issues);
+		await this.#closeResource("worker", () => this.#network?.close(), signal, issues);
+		await this.#closeResource("worker", () => this.#downloads?.close(), signal, issues);
+		await this.#closeResource("worker", () => this.#tracing?.dispose(), signal, issues);
+		await this.#closeResource("worker", () => this.#consoleCapture.detach(), signal, issues);
+		await this.#closeResource("worker", () => this.#emulation?.dispose(), signal, issues);
+		const page = this.#page;
+		if (this.#ownsPage && !this.#preservePage && page && !page.isClosed()) {
+			await this.#closeResource("target", () => page.close(), signal, issues);
+		}
+		const uncertain = issues.some(issue => issue.state === "unconfirmed") || (this.#pendingCleanup?.size ?? 0) > 0;
+		if (!uncertain) {
+			await this.#closeResource("worker", () => this.#browser?.connected ? this.#browser.disconnect() : undefined, signal, issues);
+		}
+		const cleanup: BrowserCleanupReport = {
+			version: BROWSER_EVAL_LIFETIME_VERSION,
+			targetId: this.#targetId,
+			issues,
+		};
+		this.#transport.send({ type: "closed", cleanup });
+		if (issues.some(issue => issue.state === "unconfirmed") || (this.#pendingCleanup?.size ?? 0) > 0) return;
+		this.#closed = true;
 		this.#unsub();
 		this.#uninstallRejectionGuard();
-		this.#clearElementCache();
-		const page = this.#page;
-		await this.#recording.close().catch(error => {
-			this.#log("warn", "Failed to finalize active browser recording during tab close", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-		});
-		await this.#webmcp?.dispose().catch(() => undefined);
-		this.#webmcp = undefined;
-		this.#dialogs?.dispose();
-		await this.#network?.close();
-		await this.#downloads?.close();
-		await this.#tracing?.dispose();
-		await this.#consoleCapture.detach();
-		this.#emulation?.dispose();
-		if (this.#ownsPage && page && !page.isClosed()) await page.close().catch(() => undefined);
-		if (this.#browser?.connected) this.#browser.disconnect();
-		this.#transport.send({ type: "closed" });
 		this.#transport.close();
 	}
 

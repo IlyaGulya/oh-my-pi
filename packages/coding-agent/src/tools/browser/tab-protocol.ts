@@ -1,4 +1,5 @@
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import type { BrowserCleanupReport } from "./lifetime";
 
 export type Transferable = Bun.Transferable;
 
@@ -115,13 +116,15 @@ export type WorkerInbound =
 	| { type: "run"; id: string; name: string; code: string; timeoutMs: number; session: SessionSnapshot }
 	| { type: "abort"; id: string; expectedCleanup?: boolean }
 	| { type: "tool-reply"; id: string; reply: ToolReply }
-	| { type: "close" };
+	| { type: "close"; timeoutMs?: number; preservePage?: boolean };
 
 export interface ReadyInfo {
 	url: string;
 	title?: string;
 	viewport: { width: number; height: number; deviceScaleFactor?: number };
 	targetId: string;
+	/** Native close acknowledgement semantics supported by this worker. */
+	cleanupVersion?: 1;
 }
 
 export interface RunResultOk {
@@ -175,7 +178,7 @@ export type WorkerOutbound =
 	| { type: "result"; id: string; ok: false; error: RunErrorPayload }
 	| { type: "tool-call"; id: string; runId: string; name: string; args: unknown }
 	| { type: "log"; level: "debug" | "warn" | "error"; msg: string; meta?: Record<string, unknown> }
-	| { type: "closed" };
+	| { type: "closed"; cleanup?: BrowserCleanupReport };
 
 export interface Transport {
 	send(msg: WorkerOutbound | WorkerInbound, transferList?: Transferable[]): void;

@@ -8,9 +8,10 @@ import { TempDir } from "@oh-my-pi/pi-utils/temp";
 import type { Protocol } from "devtools-protocol";
 import type { CDPSession, Page } from "puppeteer-core";
 import { resizeImage } from "../../utils/image-resize";
-import { buildChangedFrameContactSheetPng, requireMediaBinary, runFfmpeg } from "../../utils/video";
+import { buildChangedFrameContactSheetPng, requireMediaBinary, runFfmpeg, VideoProcessCleanupError } from "../../utils/video";
 import { resolveToCwd } from "../path-utils";
 import { readPageViewport } from "./launch";
+import { BrowserCleanupError } from "./lifetime";
 import type { RunOutput } from "./run-output";
 
 const DEFAULT_FPS = 30;
@@ -178,6 +179,9 @@ interface ActiveRecording {
 	nextFrame: number;
 	writeError?: unknown;
 	finalizing: boolean;
+	cleanupOnly?: boolean;
+	failure?: unknown;
+	encoderCleanup?: () => Promise<void>;
 }
 
 /** Named user-facing recording failure raised by every `tab.record*` helper. */
@@ -324,7 +328,11 @@ class CdpRecordingSource implements RecordingFrameSource {
 
 	async stop(): Promise<void> {
 		this.#stopping ??= this.#stopSession();
-		await this.#stopping;
+		try {
+			await this.#stopping;
+		} finally {
+			if (!this.#session) this.#stopping = undefined;
+		}
 	}
 
 	async captureFrame(quality: number, signal?: AbortSignal): Promise<Uint8Array> {
@@ -442,7 +450,7 @@ async function encodeRecording(active: ActiveRecording, durationMs: number, sign
 			signal,
 		);
 	} catch (error) {
-		if (signal?.aborted) throw error;
+		if (signal?.aborted || error instanceof VideoProcessCleanupError) throw error;
 		await runFfmpeg(
 			[
 				...input,
@@ -462,10 +470,23 @@ async function encodeRecording(active: ActiveRecording, durationMs: number, sign
 /** Persistent, disk-backed recording state owned by one tab worker. */
 export class RecordingController {
 	#active?: ActiveRecording;
-	#starting = false;
+	#startTask?: Promise<RecordingStartResult>;
+	#stopTask?: Promise<RecordingStopResult>;
+	#finalizeAbort?: AbortController;
+
+	async start(source: RecordingFrameSource, rawPath: string, cwd: string, options?: RecordingOptions, signal?: AbortSignal): Promise<RecordingStartResult> {
+		if (this.#startTask) throw new BrowserRecordingError("A recording is already starting");
+		const task = this.#startRecording(source, rawPath, cwd, options, signal);
+		this.#startTask = task;
+		try {
+			return await task;
+		} finally {
+			if (this.#startTask === task) this.#startTask = undefined;
+		}
+	}
 
 	/** Start recording frames from `source` to an absolute cwd-resolved MP4 or WebM path. */
-	async start(
+	async #startRecording(
 		source: RecordingFrameSource,
 		rawPath: string,
 		cwd: string,
@@ -473,7 +494,6 @@ export class RecordingController {
 		signal?: AbortSignal,
 	): Promise<RecordingStartResult> {
 		if (this.#active) throw new BrowserRecordingError(`A recording is already active at ${this.#active.path}`);
-		if (this.#starting) throw new BrowserRecordingError("A recording is already starting");
 		if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
 			throw new BrowserRecordingError("tab.recordStart() requires a non-empty output path");
 		}
@@ -488,12 +508,9 @@ export class RecordingController {
 		} catch (error) {
 			throw recordingError(error, "tab.recordStart()");
 		}
-		this.#starting = true;
 		let spool: TempDir | undefined;
 		try {
 			spool = await TempDir.create("@omp-browser-recording-");
-			if (validated.cursor) await source.installCursor(signal);
-			const viewport = await source.viewport(signal);
 			const active: ActiveRecording = {
 				source,
 				spool,
@@ -505,6 +522,9 @@ export class RecordingController {
 				nextFrame: 0,
 				finalizing: false,
 			};
+			this.#active = active;
+			if (validated.cursor) await source.installCursor(signal);
+			const viewport = await source.viewport(signal);
 			const onFrame = (frame: RecordingFrame): Promise<void> => {
 				const index = active.nextFrame++;
 				const framePath = active.spool.join(`frame-${String(index).padStart(9, "0")}.jpg`);
@@ -530,20 +550,41 @@ export class RecordingController {
 				},
 				signal,
 			);
-			this.#active = active;
 			return { path: absolutePath, fps: validated.fps };
 		} catch (error) {
-			if (validated.cursor) await source.removeCursor();
-			await source.stop().catch(() => undefined);
-			await spool?.remove().catch(() => undefined);
+			const active = this.#active;
+			if (active) {
+				active.cleanupOnly = true;
+				active.failure = error;
+				try {
+					await this.stop({ signal });
+				} catch (cleanupError) {
+					if (this.#active) throw cleanupError;
+				}
+			} else {
+				await spool?.remove();
+			}
 			throw recordingError(error, "tab.recordStart()");
+		}
+	}
+
+	async stop(context: RecordingStopContext = {}): Promise<RecordingStopResult> {
+		if (this.#stopTask) throw new BrowserRecordingError("tab.recordStop() is already finalizing the active recording");
+		const controller = new AbortController();
+		this.#finalizeAbort = controller;
+		const signal = context.signal ? AbortSignal.any([context.signal, controller.signal]) : controller.signal;
+		const task = this.#stopRecording({ ...context, signal });
+		this.#stopTask = task;
+		try {
+			return await task;
 		} finally {
-			this.#starting = false;
+			if (this.#stopTask === task) this.#stopTask = undefined;
+			if (this.#finalizeAbort === controller) this.#finalizeAbort = undefined;
 		}
 	}
 
 	/** Stop and finalize the active recording. */
-	async stop(context: RecordingStopContext = {}): Promise<RecordingStopResult> {
+	async #stopRecording(context: RecordingStopContext): Promise<RecordingStopResult> {
 		const active = this.#active;
 		if (!active) throw new BrowserRecordingError("tab.recordStop() requires an active recording");
 		if (active.finalizing)
@@ -552,7 +593,9 @@ export class RecordingController {
 		const durationMs = Math.max(0, Date.now() - active.startedAt);
 		const contactPath = `${active.path}.contact.png`;
 		let finalized = false;
+		let failure: unknown;
 		try {
+			if (active.cleanupOnly) throw active.failure ?? new BrowserRecordingError("Recording cleanup is incomplete");
 			await untilAborted(context.signal, () => active.source.stop());
 			await Promise.all(active.pendingWrites);
 			if (active.writeError) throw active.writeError;
@@ -595,17 +638,41 @@ export class RecordingController {
 				...(contactSheet ? { contactSheet } : {}),
 			};
 		} catch (error) {
+			failure = error;
+			if (error instanceof VideoProcessCleanupError) active.encoderCleanup = error.confirmStopped;
 			throw recordingError(error, "tab.recordStop()");
 		} finally {
-			await active.source.stop().catch(() => undefined);
-			await Promise.all(active.pendingWrites);
-			if (active.options.cursor) await active.source.removeCursor();
-			await active.spool.remove().catch(() => undefined);
-			if (this.#active === active) this.#active = undefined;
-			if (!finalized) {
-				await fs.rm(active.path, { force: true }).catch(() => undefined);
-				await fs.rm(contactPath, { force: true }).catch(() => undefined);
+			const errors: unknown[] = [];
+			if (active.encoderCleanup) {
+				try {
+					await active.encoderCleanup();
+					active.encoderCleanup = undefined;
+				} catch (error) {
+					errors.push(error);
+				}
 			}
+			try {
+				await active.source.stop();
+				await Promise.all(active.pendingWrites);
+				if (active.options.cursor) await active.source.removeCursor();
+				if (!active.encoderCleanup) await active.spool.remove();
+				if (!finalized) {
+					await fs.rm(active.path, { force: true });
+					await fs.rm(contactPath, { force: true });
+				}
+			} catch (error) {
+				errors.push(error);
+			}
+			if (errors.length > 0) {
+				active.cleanupOnly = true;
+				active.failure ??= failure;
+				active.finalizing = false;
+				throw new BrowserCleanupError([
+					{ resource: "recording", state: "unconfirmed" },
+					...(active.encoderCleanup ? [{ resource: "encoder" as const, state: "unconfirmed" as const }] : []),
+				], failure === undefined ? errors : [failure, ...errors]);
+			}
+			if (this.#active === active) this.#active = undefined;
 		}
 	}
 
@@ -634,9 +701,17 @@ export class RecordingController {
 		};
 	}
 
-	/** Finalize the active recording during tab teardown, discarding failed output. */
-	async close(): Promise<void> {
-		if (!this.#active) return;
-		await this.stop();
+	/** Join any in-flight start/finalization; teardown cancellation also stops its encoder. */
+	async close(context: RecordingStopContext = {}): Promise<void> {
+		const abort = () => this.#finalizeAbort?.abort(context.signal?.reason);
+		context.signal?.addEventListener("abort", abort, { once: true });
+		if (context.signal?.aborted) abort();
+		try {
+			if (this.#startTask) await this.#startTask;
+			if (this.#stopTask) await this.#stopTask;
+			else if (this.#active) await this.stop(context);
+		} finally {
+			context.signal?.removeEventListener("abort", abort);
+		}
 	}
 }

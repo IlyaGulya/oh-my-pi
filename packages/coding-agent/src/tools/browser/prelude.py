@@ -592,6 +592,14 @@ def _make_browser():
         def __repr__(self):
             return "<browser>"
 
+        async def capabilities(self):
+            """Report native ownership capabilities for this Eval surface."""
+            details = await _invoke("capabilities", {})
+            result = details.get("capabilities")
+            if not isinstance(result, dict) or result.get("version") != 1:
+                raise RuntimeError("Browser host does not expose the native Eval lifetime contract")
+            return result
+
         async def open(
             self,
             *,

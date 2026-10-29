@@ -242,6 +242,49 @@ describe("browser JavaScript facade", () => {
 		expect(message).not.toContain("{ url");
 		expect(calls).toEqual([]);
 	});
+	for (const host of ["legacy", "unsupported-surface"] as const) {
+		it(`refuses ${host} Eval ownership before a native open can occur`, async () => {
+			let opened = false;
+			const context = createContext({
+				__omp_log__: () => {},
+				__omp_prelude__: async (_name: string, parameters: unknown) => {
+					if (field(parameters, "action") === "capabilities") {
+						return { details: host === "legacy" ? {} : { capabilities: {
+							version: 1, evalLifetime: { supported: false, receiptVersion: 1, backends: ["headless", "relay"] },
+						} } };
+					}
+					opened = true;
+					return responseFor(parameters);
+				},
+			});
+			runInContext(createBrowserPrelude(makeSession()).javascript, context);
+			await expect(runInContext('browser.open({name:"owned",lifetime:"eval"})', context)).rejects.toThrow();
+			expect(opened).toBe(false);
+		});
+	}
+
+	it("refuses to record when an accepting host returns a borrowed-page receipt", async () => {
+		let recorded = false;
+		const context = createContext({
+			__omp_log__: () => {},
+			__omp_prelude__: async (_name: string, parameters: unknown) => {
+				if (field(parameters, "action") === "capabilities") return { details: { capabilities: {
+					version: 1, evalLifetime: { supported: true, receiptVersion: 1, backends: ["headless", "relay"] },
+				} } };
+				if (field(parameters, "action") === "open") return { details: {
+					name: "owned", browser: "headless", ownership: {
+						version: 1, lifetime: "eval", ownerGeneration: "run", leaseId: "lease", targetId: "target",
+						created: false, ownsPage: false,
+					},
+				} };
+				if (firstChainMethod(parameters) === "recordStart") recorded = true;
+				return responseFor(parameters);
+			},
+		});
+		runInContext(createBrowserPrelude(makeSession()).javascript, context);
+		await expect(runInContext('(async()=>{const tab=await browser.open({name:"owned",lifetime:"eval"});await tab.recordStart("capture.mp4")})()', context)).rejects.toThrow();
+		expect(recorded).toBe(false);
+	});
 });
 
 describe("browser facade in real Eval runtimes", () => {

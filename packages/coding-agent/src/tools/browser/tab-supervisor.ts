@@ -52,6 +52,13 @@ import {
 	type WorkerInitPayload,
 	type WorkerOutbound,
 } from "./tab-protocol";
+import {
+	BROWSER_EVAL_LIFETIME_VERSION,
+	BrowserCleanupError,
+	type BrowserCleanupIssue,
+	type BrowserCleanupReport,
+	type BrowserEvalOwnership,
+} from "./lifetime";
 
 import { cfgBrowserScreenshotDir } from "./settings";
 import { listTernBlocks, noTernBlockError, pickTernBlock } from "./tern/blocks";
@@ -131,6 +138,7 @@ export interface WorkerTabSession extends TabSessionBase<PuppeteerBrowserHandle>
 	worker: WorkerHandle;
 	/** omp created this page (headless, or a relay open without a target): closing the tab closes it. */
 	ownsPage: boolean;
+	evalOwnership?: BrowserEvalOwnership;
 	/**
 	 * The tab's upload staging folder. It outlives the tab's workers, since Chrome reads a picked file only when the page
 	 * does, and goes with the page when omp closes it; a page left open in the user's browser keeps it until the sweep.
@@ -262,6 +270,156 @@ const OPEN_NAVIGATION_REPORT_MS = 500;
 // vanished instead of a bare "not alive". Cleared when the name is opened again.
 const killedTabs = new Map<string, string>();
 const DEFAULT_TAB_CLOSE_TIMEOUT_MS = 5_000;
+let evalOwnedTabs: Map<string, WorkerTabSession> | undefined;
+
+interface NativeClose {
+	promise: Promise<BrowserCleanupReport>;
+	report?: BrowserCleanupReport;
+}
+interface RetainedCleanup {
+	id: string;
+	browser: PuppeteerBrowserHandle;
+	worker: WorkerHandle;
+	targetId?: string;
+	tab?: WorkerTabSession;
+	preservePage: boolean;
+}
+const nativeCloses = new WeakMap<WorkerHandle, NativeClose>();
+const nativeCleanupInflight = new WeakMap<WorkerHandle, { promise: Promise<void>; preservePage: boolean }>();
+let retainedCleanups: Map<WorkerHandle, RetainedCleanup> | undefined;
+
+function requestNativeClose(worker: WorkerHandle, browser: PuppeteerBrowserHandle, timeoutMs: number, preservePage = false): NativeClose {
+	const prior = nativeCloses.get(worker);
+	if (prior) {
+		if (prior.report?.issues.some(issue => issue.state === "unconfirmed")) {
+			try { worker.send({ type: "close", timeoutMs, preservePage }); } catch { /* Retain the unresolved native acknowledgement. */ }
+		}
+		return prior;
+	}
+	const pending = Promise.withResolvers<BrowserCleanupReport>();
+	const close: NativeClose = { promise: pending.promise };
+	nativeCloses.set(worker, close);
+	const unsubscribe = worker.onMessage(msg => {
+		if (msg.type === "page-created") {
+			workerPageTargets.set(worker, msg.targetId);
+			const scope = sharedScopeOf(browser);
+			if (scope) void recordSharedTarget(scope, msg.targetId);
+			const retained = retainedCleanups?.get(worker);
+			if (retained) retained.targetId = msg.targetId;
+		} else if (msg.type === "closed") {
+			if (msg.cleanup?.version !== BROWSER_EVAL_LIFETIME_VERSION) return;
+			close.report = msg.cleanup;
+			if (!msg.cleanup.issues.some(issue => issue.state === "unconfirmed")) pending.resolve(msg.cleanup);
+		}
+	});
+	const unsubscribeError = worker.onError(error => pending.reject(error));
+	void pending.promise.then(
+		() => {
+			unsubscribe();
+			unsubscribeError();
+			const retained = retainedCleanups?.get(worker);
+			if (retained) void retryBrowserCleanup(retained.id).catch(() => logger.error("Native browser cleanup remains unconfirmed", { workerId: retained.id }));
+		},
+		() => { unsubscribe(); unsubscribeError(); },
+	);
+	try {
+		worker.send({ type: "close", timeoutMs, preservePage });
+	} catch (error) {
+		pending.reject(error);
+	}
+	return close;
+}
+
+function closeNativeWorker(browser: PuppeteerBrowserHandle, worker: WorkerHandle, timeoutMs: number, tab?: WorkerTabSession, preservePage = false): Promise<void> {
+	const ongoing = nativeCleanupInflight.get(worker);
+	if (ongoing) {
+		if (preservePage || !ongoing.preservePage) return ongoing.promise;
+		const close = () => closeNativeWorker(browser, worker, timeoutMs, tab, false);
+		return ongoing.promise.then(close, close);
+	}
+	const promise = closeNativeWorkerImpl(browser, worker, timeoutMs, tab, preservePage);
+	const entry = { promise, preservePage };
+	nativeCleanupInflight.set(worker, entry);
+	void promise.finally(() => {
+		if (nativeCleanupInflight.get(worker) === entry) nativeCleanupInflight.delete(worker);
+	}).catch(() => undefined);
+	return promise;
+}
+
+async function closeNativeWorkerImpl(
+	browser: PuppeteerBrowserHandle,
+	worker: WorkerHandle,
+	timeoutMs: number,
+	tab?: WorkerTabSession,
+	preservePage = false,
+): Promise<void> {
+	preservePage &&= retainedCleanups?.get(worker)?.preservePage ?? true;
+	const close = requestNativeClose(worker, browser, timeoutMs, preservePage);
+	try {
+		await withTimeout(close.promise, timeoutMs + GRACE_MS, "Native browser cleanup acknowledgement timed out");
+	} catch {
+		// A timeout never authorizes terminating a worker with an unconfirmed encoder.
+	}
+	const owns = tab?.ownsPage ?? true;
+	const targetId = owns ? (tab?.targetId ?? workerPageTargets.get(worker) ?? close.report?.targetId) : undefined;
+	const scope = sharedScopeOf(browser);
+	let targetClosed = preservePage || !owns;
+	if (targetId && !preservePage) {
+		if (scope) await recordSharedTarget(scope, targetId);
+		try {
+			targetClosed = await withTimeout(closeTargetById(browser, targetId, timeoutMs / 2), timeoutMs, "Native target closure timed out");
+		} catch {
+			targetClosed = false;
+		}
+	} else if (close.report && !close.report.issues.some(issue => issue.state === "unconfirmed")) {
+		// A quiescent worker which created no page has no owned target to close.
+		targetClosed = true;
+	}
+	const issues: BrowserCleanupIssue[] = close.report ? close.report.issues.map(issue => ({ ...issue })) : [{ resource: "worker", state: "unconfirmed" }];
+	let workerStopped = !issues.some(issue => issue.state === "unconfirmed");
+	if (workerStopped) {
+		try {
+			await withTimeout(worker.terminate(), timeoutMs, "Native worker termination timed out");
+		} catch {
+			workerStopped = false;
+			issues.push({ resource: "worker", state: "unconfirmed" });
+		}
+	}
+	if (!targetClosed) issues.push({ resource: "target", state: "unconfirmed" });
+	let retained = retainedCleanups?.get(worker);
+	if (!workerStopped || !targetClosed) {
+		if (!retained) {
+			holdBrowser(browser);
+			retained = { id: crypto.randomUUID(), browser, worker, targetId, tab, preservePage };
+			(retainedCleanups ??= new Map()).set(worker, retained);
+		}
+		retained.preservePage &&= preservePage;
+		if (scope && !targetClosed) recheckSharedBrowser(scope);
+	} else {
+		if (!preservePage && scope && targetId) await forgetSharedTarget(scope, targetId);
+		workerPageTargets.delete(worker);
+		if (!preservePage && tab?.evalOwnership) evalOwnedTabs?.delete(tab.evalOwnership.leaseId);
+		if (!preservePage && tab?.ownsPage) await removeUploadStaging(tab.uploadDir);
+		if (retained) {
+			retainedCleanups?.delete(worker);
+			await releaseBrowser(retained.browser, { kill: false });
+		}
+	}
+	if (issues.length > 0) {
+		throw new BrowserCleanupError(issues.map(issue => ({
+			...issue,
+			workerId: retained?.id,
+			targetId: issue.targetId ?? targetId,
+			ownerGeneration: tab?.evalOwnership?.ownerGeneration,
+		})));
+	}
+}
+
+/** Retry only one retained native identity; never resolve a reusable tab name. */
+export async function retryBrowserCleanup(workerId: string): Promise<void> {
+	const retained = retainedCleanups && Array.from(retainedCleanups.values()).find(entry => entry.id === workerId);
+	if (retained) await closeNativeWorker(retained.browser, retained.worker, DEFAULT_TAB_CLOSE_TIMEOUT_MS, retained.tab, retained.preservePage);
+}
 // What every worker replacement resets, for results that report one.
 const WORKER_RESETS =
 	"Tab state set since it was opened was reset (tab.route routes, emulation and user agent, init scripts, element ids, the request log, HAR recording, run globals)";
@@ -327,6 +485,30 @@ async function waitForTabCleanup<T>(
 
 export function getTab(name: string): TabSession | undefined {
 	return tabs.get(name);
+}
+
+/** Only the serialized new-page acquisition path may issue a lease receipt. */
+export function claimEvalTab(tab: WorkerTabSession, ownerGeneration: string): BrowserEvalOwnership {
+	if (!ownerGeneration || !tab.ownsPage || tab.state !== "alive" || tabs.get(tab.name) !== tab || tab.evalOwnership) {
+		throw new ToolError("Eval ownership requires an unclaimed native page created by this open");
+	}
+	const ownership: BrowserEvalOwnership = {
+		version: BROWSER_EVAL_LIFETIME_VERSION,
+		lifetime: "eval",
+		ownerGeneration,
+		leaseId: crypto.randomUUID(),
+		targetId: tab.targetId,
+		created: true,
+		ownsPage: true,
+	};
+	tab.evalOwnership = ownership;
+	(evalOwnedTabs ??= new Map()).set(ownership.leaseId, tab);
+	return ownership;
+}
+
+/** Resolve a receipt, never a reused tab name. Retained uncertain closes stay addressable. */
+export function getEvalOwnedTab(leaseId: string): WorkerTabSession | undefined {
+	return evalOwnedTabs?.get(leaseId);
 }
 
 /** JSON-safe metadata for one managed browser tab. */
@@ -550,6 +732,7 @@ async function acquireTabImpl(
 		if (opts.requireNewOwnedPage && !ownsPage(initPayload)) {
 			throw new ToolError("Eval lifetime cannot adopt a borrowed browser page");
 		}
+		if (opts.signal?.aborted) throw new ToolAbortError("Browser tab open aborted");
 		worker = await spawnTabWorker();
 	} catch (error) {
 		// Failing before the worker took its own hold must release the
@@ -566,16 +749,12 @@ async function acquireTabImpl(
 	const initBudgetMs = opts.timeoutMs + GRACE_MS;
 	let info: ReadyInfo;
 	try {
-		info = await initializeTabWorker(worker, initPayload, initBudgetMs, startedAt);
+		info = await untilAborted(opts.signal, initializeTabWorker(worker, initPayload, initBudgetMs, startedAt, opts.signal));
 	} catch (error) {
 		// `BuildMessage`-class failures arrive asynchronously via the worker's `error` event,
 		// after `spawnTabWorker`'s synchronous try/catch has already returned. Fall back to
 		// the inline worker here so module-resolution failures don't poison every tab open.
-		await worker.terminate().catch(() => undefined);
-		// A headless worker that died mid-init may have already created its page in the
-		// shared browser — a killed worker can't close it, so close the target the worker
-		// reported (no-op when it never got that far).
-		closeAbandonedWorkerPage(browser, worker);
+		await closeAbandonedWorkerPage(browser, worker);
 		if (worker.mode === "inline" || isReportedInitFailure(error)) {
 			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
 			throw error;
@@ -583,7 +762,7 @@ async function acquireTabImpl(
 		// Fail fast once the caller's init budget is exhausted: its timeout has already
 		// fired, so a retried result would only be discarded by the post-init abort check —
 		// don't spend the phase floors' excess on a cold start nobody is waiting for.
-		if (initBudgetExhausted(initBudgetMs, startedAt)) {
+		if (opts.signal?.aborted || initBudgetExhausted(initBudgetMs, startedAt)) {
 			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
 			throw error;
 		}
@@ -592,10 +771,9 @@ async function acquireTabImpl(
 		});
 		worker = await spawnInlineWorker();
 		try {
-			info = await initializeTabWorker(worker, initPayload, initBudgetMs, startedAt);
+			info = await untilAborted(opts.signal, initializeTabWorker(worker, initPayload, initBudgetMs, startedAt, opts.signal));
 		} catch (inlineError) {
-			await worker.terminate().catch(() => undefined);
-			closeAbandonedWorkerPage(browser, worker);
+			await closeAbandonedWorkerPage(browser, worker);
 			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
 			const finalError = new ToolError(
 				`Failed to start browser tab worker (inline fallback also failed): ${inlineError instanceof Error ? inlineError.message : String(inlineError)}`,
@@ -612,11 +790,11 @@ async function acquireTabImpl(
 	// a fresh browser held by nothing but this aborted open is not orphaned in
 	// the registry; a browser still leased/held elsewhere (refCount > 0) is left
 	// for its owner to release.
-	if (opts.signal?.aborted && !opts.onCreated) {
-		await worker.terminate().catch(() => undefined);
-		closeAbandonedWorkerPage(browser, worker);
+	if (opts.signal?.aborted || (opts.requireNewOwnedPage && info.cleanupVersion !== BROWSER_EVAL_LIFETIME_VERSION)) {
+		await closeAbandonedWorkerPage(browser, worker);
 		if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false }).catch(() => undefined);
-		throw new ToolAbortError("Browser tab open aborted");
+		if (opts.signal?.aborted) throw new ToolAbortError("Browser tab open aborted");
+		throw new ToolError("Native browser worker does not support confirmed Eval lifetime cleanup");
 	}
 
 	holdBrowser(browser);
@@ -1126,9 +1304,7 @@ async function runInTabWithSnapshot(
 				// Both paths below kill an inline worker's tab, and its `terminate()` is a no-op: without the close
 				// handshake its core keeps its relay connection and could claim the tab again once it is re-announced.
 				if (tab.worker.mode === "inline" && tabs.get(name) === tab && tab.state === "alive") {
-					const closed = waitForClosed(tab).catch(() => undefined);
-					safeSend(tab, { type: "close" });
-					await closed;
+					await waitForClosed(tab);
 				}
 				if (error.reason === USER_CANCELLED_DEBUGGER) {
 					// The relay hides a tab whose debugging bar the user cancelled, so a re-adoption cannot succeed.
@@ -1242,6 +1418,13 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 	if (!tab) {
 		logger.debug("releaseTab: unknown tab", { name });
 		return false;
+	}
+	if (tab.backend === "worker" && retainedCleanups?.has(tab.worker) && !releaseInflight.has(tab)) {
+		const failure = releaseFailures?.get(tab);
+		await closeNativeWorker(tab.browser, tab.worker, opts.timeoutMs ?? DEFAULT_TAB_CLOSE_TIMEOUT_MS, tab);
+		if (opts.expectedTab && failure) throw failure;
+		releaseFailures?.delete(tab);
+		return true;
 	}
 	// Join explicit close of this exact object even if its name has since been reused.
 	if (opts.expectedTab && tabs.get(name) !== tab && !releaseInflight.has(tab)) {
@@ -1382,86 +1565,43 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		return true;
 	}
 	let cleanupError: unknown;
-	let targetCloseFailed = false;
-	if (wasAlive) {
-		try {
-			tab.worker.send({ type: "close" });
-			await waitForClosed(tab);
-		} catch {
-			// The close by id below confirms an owned page is gone either way.
-		}
-	}
-	await tab.worker.terminate().catch(() => undefined);
-	// omp closes the pages it owns, and with them goes the last reader of their staged uploads.
-	if (tab.ownsPage) await removeUploadStaging(tab.uploadDir);
-	// Close a live tab's owned page by id as well, which confirms it is gone: a worker's own
-	// close can fail and still report `closed` (its CDP socket broke), and the relay retracts a
-	// target whose debugger the user dismissed, so the worker cannot close it at all. A dead
-	// tab's page was closed by the teardown that killed it.
-	if (tab.ownsPage && wasAlive) {
-		try {
-			// `false` is "not confirmed closed" (the CDP session could not be
-			// created, or `Target.getTargets` failed) — the same unconfirmed
-			// state the timeout reports as an error, so both mark the tab.
-			targetCloseFailed = !(await waitForTabCleanup(
-				tab,
-				timeoutMs,
-				`orphan CDP target ${JSON.stringify(tab.targetId)} (Page.close)`,
-				closeOrphanTarget(tab, timeoutMs),
-			));
-		} catch (error) {
-			targetCloseFailed = true;
-			cleanupError = error;
-		}
+	try {
+		await closeNativeWorker(tab.browser, tab.worker, timeoutMs, tab);
+	} catch (error) {
+		cleanupError = error;
 	}
 	try {
 		await releaseBrowser(tab.browser, {
 			kill: opts.kill ?? false,
 			timeoutMs,
-			resource: `tab ${JSON.stringify(name)}`,
+			resource: "native browser tab",
 		});
 	} catch (error) {
-		cleanupError ??= error;
+		cleanupError = new BrowserCleanupError([{ resource: "browser", state: "unconfirmed", targetId: tab.targetId }], [cleanupError, error]);
 	} finally {
 		if (tabs.get(name) === tab) tabs.delete(name);
-		const scope = sharedScopeOf(tab.browser);
-		if (scope) {
-			if (targetCloseFailed) {
-				// The target outlived its close, so it is still open in the
-				// shared Chromium. Keep its durable ownership record — the only
-				// handle a later reap has on it — instead of forgetting a target
-				// that was never closed, and re-check the browser itself: a
-				// Chromium that stopped answering its CDP endpoint holds every
-				// unclosable target and must be replaced, not left to grow until
-				// the last omp client in the project exits.
-				recheckSharedBrowser(scope);
-			} else {
-				void forgetSharedTarget(scope, tab.targetId);
-			}
-		} else if (targetCloseFailed) {
-			// Nothing here can retry it; a relay closes a tab of an offline browser once that browser reconnects.
-			logger.warn("Could not confirm a browser tab omp opened was closed; it may still be open", {
-				targetId: tab.targetId,
-			});
-		}
 	}
 	if (cleanupError) throw cleanupError;
-	if (targetCloseFailed) throw new ToolError("Browser target closure could not be confirmed");
 	return true;
 }
 
-export async function releaseAllTabs(opts: ReleaseTabOptions = {}): Promise<number> {
-	const names = [...tabs.keys()];
-	let count = 0;
-	for (const name of names) {
-		if (await releaseTab(name, opts)) count++;
+async function releaseTabSet(selected: readonly TabSession[], opts: ReleaseTabOptions): Promise<number> {
+	const results = await Promise.allSettled(selected.map(tab => releaseTab(tab.name, { ...opts, expectedTab: tab })));
+	const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+	if (errors.length > 0) {
+		throw new BrowserCleanupError(errors.flatMap(error => error instanceof BrowserCleanupError
+			? [...error.issues]
+			: [{ resource: "worker" as const, state: "failed" as const }]), errors);
 	}
-	return count;
+	return results.filter(result => result.status === "fulfilled" && result.value).length;
+}
+
+export async function releaseAllTabs(opts: ReleaseTabOptions = {}): Promise<number> {
+	return await releaseTabSet([...tabs.values()], opts);
 }
 
 export async function dropHeadlessTabs(): Promise<void> {
-	const names = [...tabs.values()].filter(tab => tab.kindTag === "headless").map(tab => tab.name);
-	for (const name of names) await releaseTab(name);
+	await releaseTabSet([...tabs.values()].filter(tab => tab.kindTag === "headless"), {});
 }
 
 /**
@@ -1479,12 +1619,7 @@ export async function dropHeadlessTabs(): Promise<void> {
  */
 export async function releaseTabsForOwner(ownerId: string, opts: ReleaseTabOptions = {}): Promise<number> {
 	if (!ownerId) return 0;
-	const names = [...tabs.values()].filter(tab => tab.ownerSessionId === ownerId).map(tab => tab.name);
-	let count = 0;
-	for (const name of names) {
-		if (await releaseTab(name, opts)) count++;
-	}
-	return count;
+	return await releaseTabSet([...tabs.values()].filter(tab => tab.ownerSessionId === ownerId), opts);
 }
 
 /**
@@ -2074,7 +2209,7 @@ async function recycleTimedOutWorkerTab(
 	// must not restart the recycle's init budget.
 	const startedAt = performance.now();
 	const oldWorker = tab.worker;
-	await oldWorker.terminate().catch(() => undefined);
+	await closeNativeWorker(tab.browser, oldWorker, DEFAULT_TAB_CLOSE_TIMEOUT_MS, tab, true);
 	const browserWSEndpoint = tab.browser.browser.wsEndpoint();
 	if (!browserWSEndpoint) throw new ToolError("Browser websocket endpoint is unavailable");
 	const payload: WorkerInitPayload = {
@@ -2094,7 +2229,7 @@ async function recycleTimedOutWorkerTab(
 	// replacement published after it would drive a closed tab.
 	const publish = async (replacement: WorkerHandle, info: ReadyInfo): Promise<boolean> => {
 		if (tab.state === "dead" || tabs.get(tab.name) !== tab) {
-			await replacement.terminate().catch(() => undefined);
+			await closeNativeWorker(tab.browser, replacement, DEFAULT_TAB_CLOSE_TIMEOUT_MS, tab);
 			return false;
 		}
 		tab.worker = replacement;
@@ -2107,7 +2242,7 @@ async function recycleTimedOutWorkerTab(
 	try {
 		return await publish(worker, await initializeTabWorker(worker, payload, timeoutMs, startedAt));
 	} catch (error) {
-		await worker.terminate().catch(() => undefined);
+		await closeNativeWorker(tab.browser, worker, DEFAULT_TAB_CLOSE_TIMEOUT_MS, tab, true);
 		// The page crashed again as this attach brought it back; a second attach would only revive it once more.
 		if (error instanceof RendererCrashedError) throw error;
 		// The recycle's budget is exhausted: the run caller already timed out, so a
@@ -2120,7 +2255,7 @@ async function recycleTimedOutWorkerTab(
 		try {
 			return await publish(worker, await initializeTabWorker(worker, payload, timeoutMs, startedAt));
 		} catch (inlineError) {
-			await worker.terminate().catch(() => undefined);
+			await closeNativeWorker(tab.browser, worker, DEFAULT_TAB_CLOSE_TIMEOUT_MS, tab, true);
 			const finalError = new ToolError(
 				`Failed to recycle timed-out browser tab worker (inline fallback also failed): ${inlineError instanceof Error ? inlineError.message : String(inlineError)}`,
 			);
@@ -2172,37 +2307,13 @@ async function forceKillSurfaceTab(tab: CmuxTabSession | TernTabSession, name: s
 	if (tabs.get(name) === tab) tabs.delete(name);
 }
 
-/**
- * Teardown half of {@link forceKillTab} for a worker tab, published through the
- * release single-flight. Same rule as `releaseTabInner`: a target whose close is
- * unconfirmed (fast failure, or a close that outran its budget) keeps its
- * ownership record and re-checks the shared browser, so a wedged Chromium cannot
- * hold the page past every later reap. The close is bounded exactly as
- * `releaseTabInner` bounds it — a release joining this teardown must not inherit
- * an unbounded CDP wait (Puppeteer's protocol timeout is 60 s). Teardown must
- * still finish: the tab is already dead to its callers.
- */
+/** Forced retirement uses the same confirmed recorder/worker/target close as explicit release. */
 async function forceKillTabTeardown(tab: WorkerTabSession): Promise<void> {
-	await tab.worker.terminate().catch(() => undefined);
-	if (tab.ownsPage) await removeUploadStaging(tab.uploadDir);
-	let targetClosed = true;
-	if (tab.ownsPage) {
-		targetClosed = await waitForTabCleanup(
-			tab,
-			DEFAULT_TAB_CLOSE_TIMEOUT_MS,
-			`orphan CDP target ${JSON.stringify(tab.targetId)} (Page.close)`,
-			closeOrphanTarget(tab, DEFAULT_TAB_CLOSE_TIMEOUT_MS),
-		).catch(() => false);
-	}
-	await releaseBrowser(tab.browser, { kill: false });
-	if (tabs.get(tab.name) === tab) tabs.delete(tab.name);
-	const scope = sharedScopeOf(tab.browser);
-	if (scope) {
-		if (targetClosed) void forgetSharedTarget(scope, tab.targetId);
-		else recheckSharedBrowser(scope);
-	}
-	if (!targetClosed) {
-		(releaseFailures ??= new WeakMap()).set(tab, new ToolError("Browser target closure could not be confirmed"));
+	try {
+		await closeNativeWorker(tab.browser, tab.worker, DEFAULT_TAB_CLOSE_TIMEOUT_MS, tab);
+	} finally {
+		await releaseBrowser(tab.browser, { kill: false });
+		if (tabs.get(tab.name) === tab) tabs.delete(tab.name);
 	}
 }
 
@@ -2249,52 +2360,16 @@ function recheckSharedBrowser(scope: SharedTargetScope): void {
 	});
 }
 
-/**
- * Best-effort cleanup for a forced-kill path: close the page the tab's worker
- * reported as created. A run caller is never a browser ref holder, so the
- * browser is still in the registry; the tab's browser is the only place that
- * page can be, so no targetId guesswork across multiple sessions.
- *
- * `budgetMs` is the caller's bound on the whole close. The `targetDestroyed`
- * wait gets half of it, leaving the rest for the `Target.getTargets` fallback.
- */
-async function closeOrphanTarget(tab: WorkerTabSession, budgetMs: number): Promise<boolean> {
-	return await closeTargetById(tab.browser, tab.targetId, budgetMs / 2);
-}
 
-/**
- * Close the page a worker created (page-created) before dying during init.
- * Fire-and-forget: the caller has already timed out, so cleanup must not delay
- * error propagation. A killed worker can't clean up after itself; a shared
- * browser's other targets must never be touched.
- */
-function closeAbandonedWorkerPage(browser: PuppeteerBrowserHandle, worker: WorkerHandle): void {
-	const targetId = workerPageTargets.get(worker);
-	workerPageTargets.delete(worker);
-	if (!targetId) return;
-	// The close outlives its caller, and every caller here may go on to release
-	// the last browser reference — `closeTargetById` yields before it looks the
-	// target up, so a disconnect in that gap turns the lookup into a caught
-	// failure and leaves the page on the instance for good. Hold the browser
-	// across the close instead of blocking on it: the hold defers the release
-	// (and the dispose behind it) rather than cancelling one, so the refCount
-	// ends where it would have, one turn later.
-	holdBrowser(browser);
-	void closeTargetById(browser, targetId)
-		.catch(() => undefined)
-		.finally(() => void releaseBrowser(browser, { kill: false }).catch(() => undefined));
+/** Await the same trusted native close for a page created during a failed init. */
+async function closeAbandonedWorkerPage(browser: PuppeteerBrowserHandle, worker: WorkerHandle): Promise<void> {
+	await closeNativeWorker(browser, worker, DEFAULT_TAB_CLOSE_TIMEOUT_MS);
 }
 
 async function waitForClosed(tab: WorkerTabSession): Promise<void> {
-	const { promise, resolve } = Promise.withResolvers<void>();
-	const unsubscribe = tab.worker.onMessage(msg => {
-		if (msg.type === "closed") resolve();
-	});
-	try {
-		await raceWithTimeout(promise, GRACE_MS, "Timed out closing browser tab worker");
-	} finally {
-		unsubscribe();
-	}
+	const close = requestNativeClose(tab.worker, tab.browser, DEFAULT_TAB_CLOSE_TIMEOUT_MS);
+	const report = await withTimeout(close.promise, DEFAULT_TAB_CLOSE_TIMEOUT_MS + GRACE_MS, "Native browser cleanup acknowledgement timed out");
+	if (report.issues.length > 0) throw new BrowserCleanupError(report.issues);
 }
 
 function expandBrowserScreenshotDir(session: ToolSession): string | undefined {
@@ -2491,6 +2566,7 @@ async function initializeTabWorker(
 	payload: WorkerInitPayload,
 	timeoutMs: number,
 	deadlineStart: number = performance.now(),
+	signal?: AbortSignal,
 ): Promise<ReadyInfo> {
 	// Derive both phase budgets from the remaining caller budget so a
 	// retried attempt (inline fallback) cannot outlive the caller's timeout.
@@ -2525,13 +2601,14 @@ async function initializeTabWorker(
 		failStartup(new ToolError(`Tab worker failed during startup: ${error.message}`));
 	});
 	try {
+		if (signal?.aborted) throw new ToolAbortError("Browser tab open aborted");
 		worker.send({ type: "init", payload });
-		await raceWithTimeout(setup.promise, setupBudgetMs, "Timed out waiting for tab worker setup");
+		await untilAborted(signal, raceWithTimeout(setup.promise, setupBudgetMs, "Timed out waiting for tab worker setup"));
 		// The ready wait gets only what is left of the caller's budget at
 		// this point; the floor covers sub-3s budgets where the 2s setup
 		// floor alone exceeds it.
 		const readyBudgetMs = Math.max(READY_BUDGET_FLOOR_MS, timeoutMs - Math.round(performance.now() - deadlineStart));
-		return await raceWithTimeout(ready.promise, readyBudgetMs, "Timed out initializing browser tab worker");
+		return await untilAborted(signal, raceWithTimeout(ready.promise, readyBudgetMs, "Timed out initializing browser tab worker"));
 	} finally {
 		unlisten();
 		unlistenError();

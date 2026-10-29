@@ -222,7 +222,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("native browser Eval lifetime", () => {
 			const borrowedTab = f.hold(borrowed);
 			await expect(f.run(f.openCode(persistent))).rejects.toBeInstanceOf(Error);
 			const name = f.name();
-			await f.run(`const leased = ${f.openCode(name)}; await leased.close(); ${f.openCode(name, "session")}; "replaced"`);
+			await f.run(`const leased = ${f.openCode(name)}; await leased.close(); ${f.openCode(name, "session")}; await leased.close(); "replaced"`);
 			const replacement = f.hold(name);
 			expect(await f.targets(replacement)).toContain(replacement.targetId);
 			expect(await f.targets(ordinaryTab)).toContain(ordinaryTab.targetId);

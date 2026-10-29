@@ -91,6 +91,7 @@ interface PendingRun {
 	cleanupClosed?: boolean;
 	cleanupDrain?: Promise<void>;
 	allowCleanup?: boolean;
+	cleanupOwner?: string;
 }
 
 interface JsSession {
@@ -389,7 +390,7 @@ export async function disposeAllVmContexts(): Promise<void> {
 		if (result.status !== "fulfilled") continue;
 		if (!all.includes(result.value)) all.push(result.value);
 	}
-	await Promise.all(all.map(session => killSessionFor(session, new ToolError("JS context disposed"), { force: false })));
+	await disposeSessions(all);
 }
 
 /**
@@ -422,9 +423,16 @@ export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
 		const session = result.value;
 		toKill.push(session);
 	}
-	await Promise.all(
-		toKill.map(session => killSessionFor(session, new ToolError("JS context disposed"), { force: false })),
-	);
+	await disposeSessions(toKill);
+}
+
+async function disposeSessions(selected: readonly JsSession[]): Promise<void> {
+	if (selected.length === 0) return;
+	const results = await Promise.allSettled(selected.map(session =>
+		killSessionFor(session, new ToolError("JS context disposed"), { force: false }),
+	));
+	const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+	if (errors.length > 0) throw new EvalCleanupError(errors);
 }
 
 /**
@@ -809,6 +817,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 		const value = await callSessionTool(msg.name, msg.args, {
 			session: pending.toolSession,
 			signal: ctrl.signal,
+			evalOwner: pending.cleanupOwner,
 			registerCleanup: pending.allowCleanup && msg.name === "__prelude__"
 				? cleanup => registerRunCleanup(pending, cleanup)
 				: undefined,
@@ -833,7 +842,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 }
 
 /** Register before exposing a resource; a late acquisition closes itself instead. */
-async function registerRunCleanup(pending: PendingRun, cleanup: () => Promise<void>): Promise<void> {
+async function registerRunCleanup(pending: PendingRun, cleanup: () => Promise<void>): Promise<string> {
 	if (pending.cleanupClosed || pending.aborted || pending.settled) {
 		try {
 			await cleanup();
@@ -845,6 +854,7 @@ async function registerRunCleanup(pending: PendingRun, cleanup: () => Promise<vo
 		throw new ToolError("Eval ended before its resource could be acquired");
 	}
 	(pending.cleanups ??= new Set()).add(cleanup);
+	return pending.cleanupOwner ??= crypto.randomUUID();
 }
 
 function drainRunCleanup(pending: PendingRun): Promise<void> | undefined {

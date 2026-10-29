@@ -47,7 +47,8 @@ export interface ToolBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
 	/** Trusted parent-run registrar; never derived from the per-call signal. */
-	registerCleanup?: (cleanup: () => Promise<void>) => Promise<void>;
+	registerCleanup?: (cleanup: () => Promise<void>) => Promise<string>;
+	evalOwner?: string;
 	emitStatus?: (event: JsStatusEvent) => void;
 	identity?: RuntimeCallIdentity;
 	shadowCell?: EvalShadowCellSession;
@@ -224,6 +225,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 					toolCallId,
 					signal: options.signal,
 					registerCleanup: options.registerCleanup,
+					evalOwner: options.evalOwner,
 					context: options.session.getToolContext?.(),
 				}),
 			);
