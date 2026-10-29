@@ -14,6 +14,7 @@
 - ACP now rejects terminal model failures with a structured JSON-RPC error instead of reporting a successful `end_turn`. Typed refusals and cancellation retain their outcomes; nonterminal continuations and superseded prompt handlers cannot fail a later turn.
 - Queued browser opens now reject another Eval generation's owned tab before navigation, viewport, persistence, or replacement changes (BBDEV-47).
 - Browser cleanup now reports recording finalization failures and unconfirmed native stops, retaining identity-fenced retries for uncertain releases (BBDEV-47).
+- Fixed ordinary session tabs being closed after a quiescent native worker exits; same-page recovery is restored without waiving unresolved cleanup (BBDEV-47).
 
 ## [18.12.6] - 2026-10-21
 
