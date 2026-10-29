@@ -6,11 +6,14 @@
 
 - Added SDK explicit-discovery marker 1 for scoped embeddings and opt-in ACP factory-owned MCP composition via `AcpSessionHandle.mcp`, `configureServers` and factory `options.mcpServers`, retaining native sessions and MCP teardown.
 - SDK embedders supplying an MCP manager can opt into native tool, prompt and resource refresh callbacks with `ownsMcpCallbacks`, without transferring disconnect ownership.
+- Added opt-in JavaScript Eval-lifetime browser pages with versioned ownership receipts and native recorder cleanup when the Eval ends; session lifetime remains the default (BBDEV-47).
 
 ### Fixed
 
 - Explicit SDK `contextFiles` now suppress automatic additional-root instruction discovery and refresh; disabling native discovery also prevents ambient native agent roots from overriding selected agents.
 - ACP now rejects terminal model failures with a structured JSON-RPC error instead of reporting a successful `end_turn`. Typed refusals and cancellation retain their outcomes; nonterminal continuations and superseded prompt handlers cannot fail a later turn.
+- Queued browser opens now reject another Eval generation's owned tab before navigation, viewport, persistence, or replacement changes (BBDEV-47).
+- Browser cleanup now reports recording finalization failures and unconfirmed native stops, retaining identity-fenced retries for uncertain releases (BBDEV-47).
 
 ## [18.12.6] - 2026-10-21
 
