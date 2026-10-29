@@ -27,6 +27,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/recording";
 import * as registry from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import * as sharedDaemon from "@oh-my-pi/pi-coding-agent/tools/browser/shared-daemon";
+import type { BrowserCleanupReport } from "@oh-my-pi/pi-coding-agent/tools/browser/lifetime";
 import type { WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
 import * as supervisor from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { WorkerTabSession } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
@@ -35,7 +36,8 @@ import * as uploads from "@oh-my-pi/pi-coding-agent/tools/browser/upload-files";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import * as video from "@oh-my-pi/pi-coding-agent/utils/video";
 import { isEnoent, postmortem } from "@oh-my-pi/pi-utils";
-import puppeteer, { type Browser, type CDPSession, type Page, type Target } from "puppeteer-core";
+import * as puppeteer from "puppeteer-core";
+import type { Browser, CDPSession, Frame, Page, Target } from "puppeteer-core";
 
 // Capture host scheduling before an Eval realm can replace timer globals.
 const hostImmediate = setImmediate;
@@ -84,6 +86,8 @@ function evalWorker(): JsEvalWorkerHandle {
 /** Native WorkerCore transport whose retirement only detaches this owned endpoint. */
 export class OwnedTabWorker extends EventTarget {
 	readonly closeRequested = Promise.withResolvers<void>();
+	readonly retired = Promise.withResolvers<void>();
+	targetId?: string;
 	#receive: ((message: WorkerInbound | WorkerOutbound) => void) | undefined;
 	#closing = false;
 	#retired = false;
@@ -98,6 +102,8 @@ export class OwnedTabWorker extends EventTarget {
 		try {
 			new BrowserWorkerCore({
 				send: message => {
+					if (message.type === "page-created") this.targetId = message.targetId;
+					if (message.type === "ready") this.targetId = message.info.targetId;
 					queueMicrotask(() => {
 						if (!this.#retired) this.dispatchEvent(new MessageEvent("message", { data: message }));
 					});
@@ -123,6 +129,7 @@ export class OwnedTabWorker extends EventTarget {
 		// stop a frame source just because the JS worker transport was retired.
 		if (!this.#closing) this.postMessage({ type: "close" });
 		this.#retired = true;
+		this.retired.resolve();
 	}
 
 	handle(): WorkerTabSession["worker"] {
@@ -139,9 +146,19 @@ export class OwnedTabWorker extends EventTarget {
 			terminate: async () => this.terminate(),
 		};
 	}
+
+	nextCleanupReport(): Promise<BrowserCleanupReport> {
+		const report = Promise.withResolvers<BrowserCleanupReport>();
+		const unsubscribe = this.handle().onMessage(message => {
+			if (message.type !== "closed" || !message.cleanup) return;
+			unsubscribe();
+			report.resolve(message.cleanup);
+		});
+		return report.promise;
+	}
 }
 
-interface OwnedTarget {
+export interface OwnedTarget {
 	id: string;
 	ready: PromiseWithResolvers<Page>;
 	pageRequested: PromiseWithResolvers<void>;
@@ -150,6 +167,20 @@ interface OwnedTarget {
 	allowClose: PromiseWithResolvers<void>;
 	unconfirmed: boolean;
 	present: boolean;
+	closeAttempts: number;
+}
+
+export interface OwnedPagePeer {
+	page: Page;
+	userAgentRequested: PromiseWithResolvers<void>;
+	url(): string;
+}
+
+export interface OwnedDetachGate {
+	entered: PromiseWithResolvers<void>;
+	allow: PromiseWithResolvers<void>;
+	finished: PromiseWithResolvers<void>;
+	active: boolean;
 }
 
 /** A finite frame source; gates model a collector that has not yet stopped. */
@@ -236,6 +267,10 @@ export class OwnedBrowserLifetime {
 	#workersByTab = new Map<WorkerTabSession, OwnedTabWorker>();
 	#recordingClosures = new Set<Promise<void>>();
 	#recordingFinished = new Map<recording.RecordingController, PromiseWithResolvers<void>>();
+	#additionalHandles = new Set<registry.PuppeteerBrowserHandle>();
+	#pagePeers = new Map<string, OwnedPagePeer>();
+	#acquisitionObservers = new Map<string, () => void>();
+	#downloadDetach?: OwnedDetachGate;
 
 	static async create(): Promise<OwnedBrowserLifetime> {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-owned-lifetime-fixture-"));
@@ -313,11 +348,21 @@ export class OwnedBrowserLifetime {
 		this.#restores.push(() => chromium.mockRestore());
 		const load = spyOn(launch, "loadPuppeteerInWorker").mockResolvedValue(puppeteer);
 		this.#restores.push(() => load.mockRestore());
+		const devices = spyOn(launch, "loadedKnownDevices").mockReturnValue(puppeteer.KnownDevices);
+		this.#restores.push(() => devices.mockRestore());
+		const networks = spyOn(launch, "loadedNetworkConditions").mockReturnValue(puppeteer.PredefinedNetworkConditions);
+		this.#restores.push(() => networks.mockRestore());
 		const connect = spyOn(launch, "connectPuppeteer").mockImplementation(async (_puppeteer, options) => {
 			if (options.browserWSEndpoint !== `owned-fixture:${this.owner}`) throw new Error("Non-owned CDP connection refused");
 			return this.browser();
 		});
 		this.#restores.push(() => connect.mockRestore());
+		const realStealth = launch.applyStealthPatches;
+		const stealth = spyOn(launch, "applyStealthPatches").mockImplementation(async (browser, page, state) => {
+			if ([...this.#pagePeers.values()].some(peer => peer.page === page)) return;
+			await realStealth(browser, page, state);
+		});
+		this.#restores.push(() => stealth.mockRestore());
 		const fixture = this;
 		const worker = spyOn(globalThis, "Worker").mockImplementation(function ownedWorker(entry: string, options?: { argv?: string[] }) {
 			if (!String(entry).endsWith("/tab-worker-entry.ts") && !options?.argv?.includes("__omp_worker_tab")) {
@@ -330,9 +375,17 @@ export class OwnedBrowserLifetime {
 		this.#restores.push(() => worker.mockRestore());
 		const realAcquire = supervisor.acquireTab;
 		const acquire = spyOn(supervisor, "acquireTab").mockImplementation((name, browser, options) => {
-			if (browser !== this.handle) throw new Error("Non-owned tab acquisition refused");
+			if (browser !== this.handle && !this.#additionalHandles.has(browser as registry.PuppeteerBrowserHandle)) throw new Error("Non-owned tab acquisition refused");
+			this.#acquisitionObservers.get(name)?.();
+			this.#acquisitionObservers.delete(name);
 			const operation = realAcquire(name, browser, options);
 			this.#acquisitions.add(operation);
+			void operation.then(result => {
+				if (result.tab.backend !== "worker") return;
+				this.tabs.add(result.tab);
+				const endpoint = this.workers.find(worker => worker.targetId === result.tab.targetId);
+				if (endpoint) this.#workersByTab.set(result.tab, endpoint);
+			}, () => undefined);
 			void operation.finally(() => this.#acquisitions.delete(operation)).catch(() => undefined);
 			return operation;
 		});
@@ -361,16 +414,93 @@ export class OwnedBrowserLifetime {
 			ready: Promise.withResolvers<Page>(), pageRequested: Promise.withResolvers<void>(),
 			closeRequested: Promise.withResolvers<void>(), closeFinished: Promise.withResolvers<void>(),
 			allowClose: Promise.withResolvers<void>(), unconfirmed: false, present: true,
+			closeAttempts: 0,
 		};
 		void target.ready.promise.catch(() => undefined);
 		this.targets.set(target.id, target);
 		return target;
 	}
 
+	/** Observe the next real serialized-acquisition admission; never fabricate its result. */
+	nextAcquisition(name: string): Promise<void> {
+		if (this.#acquisitionObservers.has(name)) throw new Error("Acquisition observer already registered");
+		const entered = Promise.withResolvers<void>();
+		this.#acquisitionObservers.set(name, () => entered.resolve());
+		return entered.promise;
+	}
+
+	connectedHandle(): registry.PuppeteerBrowserHandle {
+		const handle: registry.PuppeteerBrowserHandle = {
+			...this.handle, key: `${this.owner}-connected-${crypto.randomUUID()}`,
+			kind: { kind: "connected", cdpUrl: "http://owned-fixture.invalid" },
+			browser: this.browser(), sharedDaemon: undefined, refCount: 1,
+		};
+		this.#additionalHandles.add(handle);
+		return handle;
+	}
+
+	holdDownloadDetach(): OwnedDetachGate {
+		if (this.#downloadDetach) throw new Error("Download detach gate already configured");
+		return this.#downloadDetach = {
+			entered: Promise.withResolvers<void>(), allow: Promise.withResolvers<void>(),
+			finished: Promise.withResolvers<void>(), active: false,
+		};
+	}
+
+	/** Finite upstream page peer, not a renderer: native initialization/runs/cleanup remain real. */
+	pagePeer(target: OwnedTarget, options: { failUserAgent?: boolean } = {}): OwnedPagePeer {
+		if (this.targets.get(target.id) !== target || this.#pagePeers.has(target.id)) throw new Error("Non-owned or duplicate page peer");
+		const userAgentRequested = Promise.withResolvers<void>();
+		let url = `https://owned-fixture.invalid/${target.id}`;
+		let script = 0;
+		let viewport = { width: 2, height: 2, deviceScaleFactor: 1 };
+		const realm = { evaluate: async () => undefined };
+		const frame = {
+			_id: target.id, detached: false, client: this.cdp(),
+			_lifecycleEvents: new Set(["load", "DOMContentLoaded"]),
+			mainRealm: () => realm, childFrames: () => [],
+		} as unknown as Frame;
+		const page = Object.assign(new EventEmitter(), {
+			url: () => url,
+			title: async () => new URL(url).pathname,
+			isClosed: () => !target.present,
+			browser: () => this.handle.browser,
+			browserContext: () => ({}),
+			mainFrame: () => frame, frames: () => [frame],
+			target: () => ({ _targetId: target.id, createCDPSession: async () => this.cdp() }),
+			createCDPSession: async () => this.cdp(),
+			evaluateOnNewDocument: async () => ({ identifier: `owned-preload-${++script}` }),
+			removeScriptToEvaluateOnNewDocument: async () => {},
+			evaluate: async () => {
+				userAgentRequested.resolve();
+				if (options.failUserAgent) throw new Error("Owned peer failed during late initialization");
+				return "Owned fixture user agent";
+			},
+			viewport: () => viewport,
+			setViewport: async (value: typeof viewport) => { viewport = value; },
+			emulateFocusedPage: async () => {},
+			goto: async (destination: string) => {
+				if (new URL(destination).hostname !== "owned-fixture.invalid") throw new Error("Non-owned navigation refused");
+				url = destination;
+				return null;
+			},
+			close: async () => {
+				const session = this.cdp();
+				try { await session.send("Target.closeTarget", { targetId: target.id }); }
+				finally { await session.detach(); }
+			},
+		}) as unknown as Page;
+		const peer = { page, userAgentRequested, url: () => url };
+		this.#pagePeers.set(target.id, peer);
+		target.allowClose.resolve();
+		return peer;
+	}
+
 	browser(): Browser {
 		let connected = true;
 		const targetObjects = (): Target[] => [...this.targets.values()].filter(target => target.present).map(target => ({
 			_targetId: target.id,
+			type: () => "page", url: () => this.#pagePeers.get(target.id)?.url() ?? "about:blank",
 			page: async () => { target.pageRequested.resolve(); return await target.ready.promise; },
 		}) as unknown as Target);
 		return {
@@ -390,8 +520,9 @@ export class OwnedBrowserLifetime {
 	cdp(): CDPSession {
 		const session = new EventEmitter();
 		this.#sessions.add(session);
+		let downloads = false;
 		return Object.assign(session, {
-			send: async (method: string, parameters?: { targetId?: string }) => {
+			send: async (method: string, parameters?: { targetId?: string; downloadPath?: string }) => {
 				if (method === "Target.createTarget") {
 					const target = this.newTarget();
 					this.created.resolve(target);
@@ -401,9 +532,16 @@ export class OwnedBrowserLifetime {
 				if (method === "Target.getTargets") return {
 					targetInfos: [...this.targets.values()].filter(target => target.present).map(target => ({ targetId: target.id })),
 				};
+				if (["WebMCP.enable", "OMP.claimTarget", "Runtime.enable", "Network.enable"].includes(method)) return {};
+				if (method === "Browser.setDownloadBehavior") {
+					if (!parameters?.downloadPath?.startsWith(this.root + path.sep)) throw new Error("Non-owned download path refused");
+					downloads = true;
+					return {};
+				}
 				if (method !== "Target.closeTarget" || !parameters?.targetId) throw new Error(`Unexpected fixture CDP method: ${method}`);
 				const target = this.targets.get(parameters.targetId);
 				if (!target) throw new Error("Fixture refused to close an unknown target");
+				target.closeAttempts++;
 				target.closeRequested.resolve();
 				await target.allowClose.promise;
 				try {
@@ -413,17 +551,27 @@ export class OwnedBrowserLifetime {
 					return { success: true };
 				} finally { target.closeFinished.resolve(); }
 			},
-			detach: async () => { this.#sessions.delete(session); },
+			detach: async () => {
+				if (downloads && this.#downloadDetach) {
+					const gate = this.#downloadDetach;
+					gate.active = true;
+					gate.entered.resolve();
+					await gate.allow.promise;
+					gate.active = false;
+					gate.finished.resolve();
+				}
+				this.#sessions.delete(session);
+			},
 		}) as unknown as CDPSession;
 	}
 
-	start(code: string, signal?: AbortSignal, owner = this.owner): Promise<RunOutcome> {
+	start(code: string, signal?: AbortSignal, owner = this.owner, onText?: (text: string) => void): Promise<RunOutcome> {
 		this.#owners.add(owner);
 		let stdout = "";
 		const run = executeInVmContext({
 			sessionKey: owner, sessionId: owner, ownerId: owner,
 			cwd: this.root, session: this.session, filename: "[owned-native-lifetime].js", code,
-			runState: { signal, onText: text => { stdout += text; } },
+			runState: { signal, onText: text => { stdout += text; onText?.(text); } },
 		}).then<RunOutcome, RunOutcome>(
 			() => ({ ok: true, stdout }),
 			error => ({ ok: false, error: error instanceof Error ? error : new Error(String(error)), stdout }),
@@ -517,6 +665,7 @@ export class OwnedBrowserLifetime {
 		this.cancelled.abort(new Error("Owned fixture cleanup"));
 		this.encoder.finish.resolve();
 		for (const source of this.frameSources) source.allowStop.resolve();
+		this.#downloadDetach?.allow.resolve();
 		for (const target of this.targets.values()) {
 			target.ready.reject(new Error("Owned fixture released its initialization gate"));
 			target.allowClose.resolve();
@@ -532,6 +681,7 @@ export class OwnedBrowserLifetime {
 			await Promise.allSettled(this.#recordingClosures);
 			await hostTurn();
 			for (const target of this.targets.values()) await forgetSharedTarget(this.scope, target.id);
+			for (const handle of this.#additionalHandles) await registry.releaseBrowser(handle, { kill: false });
 			await fs.rm(daemonRuntimeDir(this.root), { recursive: true, force: true });
 			await fs.rm(this.root, { recursive: true, force: true });
 		} finally {
