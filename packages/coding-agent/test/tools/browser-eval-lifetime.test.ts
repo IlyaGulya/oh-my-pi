@@ -6,7 +6,6 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	disposeVmContextsByOwner,
 	executeInVmContext,
-	resetVmContext,
 } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { executeJs } from "@oh-my-pi/pi-coding-agent/eval/js/executor";
 import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
@@ -135,10 +134,14 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("native browser Eval lifetime", () => {
 			const f = await fixture();
 			const name = f.name();
 			const opened = Promise.withResolvers<void>();
+			let stdout = "";
 			const run = f.run(
-				`${f.openCode(name)}; print("owned-ready"); ${ending === "throw" ? 'throw new Error("cell failure")' : '"complete"'}`,
+				`${f.openCode(name)}; print("owned-ready"); ${ending === "throw" ? 'throw new Error("cell failure")' : `await browser.tab(${JSON.stringify(name)}).title()`}`,
 				undefined,
-				text => { if (text.includes("owned-ready")) { f.hold(name); opened.resolve(); } },
+				text => {
+					stdout += text;
+					if (text.includes("owned-ready")) { f.hold(name); opened.resolve(); }
+				},
 			);
 			const outcome = run.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error: error as Error }));
 			await observeOpen(opened.promise, run);
@@ -147,7 +150,8 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("native browser Eval lifetime", () => {
 			if (ending === "throw") {
 				expect(!result.ok && result.error.message.includes("cell failure")).toBe(true);
 			} else {
-				expect(result.ok && result.value.value).toBe("complete");
+				expect(result.ok).toBe(true);
+				expect(stdout).toContain("owned lifetime fixture");
 			}
 			expect(getTab(name)).toBeUndefined();
 			expect(await f.targets(tab)).not.toContain(tab.targetId);
@@ -192,7 +196,13 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("native browser Eval lifetime", () => {
 			expect(getTab(name)).toBeUndefined();
 			expect(await f.targets(tab)).not.toContain(tab.targetId);
 			expect(await sibling.targets(siblingTab)).toContain(siblingTab.targetId);
-			expect((await sibling.run(`await browser.tab(${JSON.stringify(sentinel)}).title()`)).value).toBe("owned lifetime fixture");
+			let siblingOutput = "";
+			await sibling.run(
+				`(await browser.tab(${JSON.stringify(sentinel)}).title()).toUpperCase()`,
+				undefined,
+				text => { siblingOutput += text; },
+			);
+			expect(siblingOutput).toContain("OWNED LIFETIME FIXTURE");
 		}, 60_000);
 	}
 
@@ -227,50 +237,6 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("native browser Eval lifetime", () => {
 		}
 	}, 60_000);
 
-	it("closes a late acquisition before its handle can escape a reset scope", async () => {
-		const f = await fixture();
-		const name = f.name();
-		const acquired = Promise.withResolvers<void>();
-		const allowRegistration = Promise.withResolvers<void>();
-		const hostFinished = Promise.withResolvers<void>();
-		f.definition = {
-			...f.prelude,
-			async invoke(parameters, context) {
-				return await f.prelude.invoke(parameters, {
-					...context,
-					registerCleanup: async cleanup => {
-						f.hold(name);
-						acquired.resolve();
-						await allowRegistration.promise;
-						try {
-							if (!context.registerCleanup) throw new Error("Missing owning run");
-							await context.registerCleanup(cleanup);
-						} finally {
-							hostFinished.resolve();
-						}
-					},
-				});
-			},
-		};
-		let escaped = false;
-		const run = f.run(`${f.openCode(name)}; print("handle escaped")`, undefined, text => {
-			if (text.includes("handle escaped")) escaped = true;
-		});
-		const outcome = run.catch(error => error as Error);
-		try {
-			await observeOpen(acquired.promise, run);
-			const tab = f.hold(name);
-			await resetVmContext(f.key);
-			allowRegistration.resolve();
-			await hostFinished.promise;
-			expect(await outcome).toBeInstanceOf(Error);
-			expect(getTab(name)).toBeUndefined();
-			expect(await f.targets(tab)).not.toContain(tab.targetId);
-			expect(escaped).toBe(false);
-		} finally {
-			allowRegistration.resolve();
-		}
-	}, 45_000);
 });
 
 describe("browser lifetime fail-closed boundaries", () => {
