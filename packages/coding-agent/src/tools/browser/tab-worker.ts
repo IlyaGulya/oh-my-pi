@@ -1536,6 +1536,7 @@ export class WorkerCore {
 	#closed = false;
 	#retryClose = false;
 	#pendingCleanup?: Set<Promise<unknown>>;
+	#cleanupFailures?: BrowserCleanupIssue[];
 	#preservePage = false;
 	/**
 	 * A back/forward cache restore brings a document back without loading it, so the frame keeps the
@@ -3516,20 +3517,25 @@ export class WorkerCore {
 			const uncertain = !settled || (error instanceof BrowserCleanupError && error.uncertain) ||
 				(resource === "recording" && this.#recording.status().active);
 			issues.push({ resource, state: uncertain ? "unconfirmed" : "failed", targetId: this.#targetId });
+			if (!uncertain) (this.#cleanupFailures ??= []).push({ resource, state: "failed", targetId: this.#targetId });
 			if (!settled) {
 				(this.#pendingCleanup ??= new Set()).add(task);
-				const finished = () => {
+				const finished = (failed: boolean, error?: unknown) => {
 					this.#pendingCleanup?.delete(task);
+					if (failed && !(error instanceof BrowserCleanupError && error.uncertain) &&
+						!(resource === "recording" && this.#recording.status().active)) {
+						(this.#cleanupFailures ??= []).push({ resource, state: "failed", targetId: this.#targetId });
+					}
 					if (this.#pendingCleanup?.size === 0) this.#scheduleClose();
 				};
-				void task.then(finished, finished);
+				void task.then(() => finished(false), error => finished(true, error));
 			}
 		}
 	}
 
 	async #closeResources(timeoutMs: number): Promise<void> {
 		const signal = AbortSignal.timeout(Math.max(1, timeoutMs));
-		const issues: BrowserCleanupIssue[] = [];
+		const issues: BrowserCleanupIssue[] = this.#cleanupFailures?.slice() ?? [];
 		if (this.#initializing) await this.#closeResource("worker", () => this.#initializing, signal, issues);
 		this.#clearElementCache();
 		await this.#closeResource("recording", () => this.#recording.close({ signal }), signal, issues);
